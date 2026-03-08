@@ -56,14 +56,20 @@ class EmbedConfig:
     """嵌入模型参数。
 
     属性:
-        model_name: 嵌入模型名称。
+        backend: 嵌入后端类型，"local"（sentence-transformers）或 "remote"（OpenAI 兼容 API）。
+        model_name: 本地模式为 HuggingFace 模型名，远程模式为 API 模型名。
         embed_dim: 嵌入维度 D。
-        device: 推理设备，"cuda" 或 "cpu"。
+        device: 推理设备，"cuda" 或 "cpu"（仅本地模式使用）。
+        api_key: 远程模式 API 密钥，从 .env 加载。本地模式为空串。
+        api_url: 远程模式 API 端点。本地模式为空串。
     """
 
+    backend: str
     model_name: str
     embed_dim: int
     device: str
+    api_key: str
+    api_url: str
 
 
 @dataclass
@@ -310,6 +316,10 @@ class Config:
                 "VLM_API_KEY": ("vlm", "api_key"),
                 "VLM_MODEL": ("vlm", "model"),
                 "VLM_API_URL": ("vlm", "api_url"),
+                "EMBED_BACKEND": ("embed", "backend"),
+                "EMBED_MODEL": ("embed", "model_name"),
+                "EMBED_API_KEY": ("embed", "api_key"),
+                "EMBED_API_URL": ("embed", "api_url"),
             }
             for env_name, (section, field) in _ENV_MAP.items():
                 if env_vars.get(env_name):

@@ -7,9 +7,12 @@ tree:
   cache_dir: "cache/trees"
 
 embed:
+  backend: "local"                    # "local" (sentence-transformers) | "remote" (OpenAI 兼容 API)
   model_name: "BAAI/bge-base-zh-v1.5"
-  embed_dim: 768
+  embed_dim: 2560
   device: "cuda"
+  api_key: ""                         # 远程模式从 .env 覆盖
+  api_url: ""                         # 远程模式从 .env 覆盖
 
 llm:
   backend: "qwen"
@@ -28,7 +31,7 @@ vlm:
   # api_key: 从 .env 加载，此处不写
 
 retriever:
-  embed_dim: 768
+  embed_dim: 2560
   num_heads: 4
   L_layers: 2
   L_cycles: 4
