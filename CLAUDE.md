@@ -28,7 +28,7 @@ conda activate Video-Tree-TRM
 
 # 推荐：使用 conda run 执行命令（自动使用正确环境）
 conda run -n Video-Tree-TRM pip install xxx
-conda run -n Video-Tree-TRM pytest xxx
+conda run -n Video-Tree-TRM python -m pytest xxx #注意不能conda run -n Video-Tree-TRM pytest xxx，因为这样子pytest不会调用Video-Tree-TRM
 conda run -n Video-Tree-TRM python xxx
 
 # 或者：在命令前激活环境

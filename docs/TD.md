@@ -111,34 +111,60 @@ class TreeIndex:
 ### 1.2 embeddings.py — 嵌入服务
 
 **文件**: `video_tree_trm/embeddings.py`
-**职责**: 封装文本嵌入器，提供统一 `text_embed()` 接口，冻结不训练。
+**职责**: 封装文本嵌入器，支持本地 sentence-transformers 和远程 OpenAI 兼容 API 双后端，冻结不训练。
 
 ```python
 class EmbeddingModel:
-    """文本嵌入器封装（冻结）"""
+    """文本嵌入器封装（冻结），支持本地/远程双后端。"""
 
-    def __init__(self, model_name: str, device: str):
-        """加载 sentence-transformers 模型"""
-        self.model = SentenceTransformer(model_name, device=device)
-        self.model.eval()
-        self.dim = self.model.get_sentence_embedding_dimension()
+    def __init__(self, config: EmbedConfig):
+        """
+        根据 config.backend 初始化:
+          - "local": 加载 sentence-transformers 模型，冻结参数
+          - "remote": 初始化 OpenAI 兼容 API 客户端
+        """
+
+    @property
+    def dim(self) -> int:
+        """嵌入维度 D"""
 
     def embed(self, texts: Union[str, List[str]]) -> ndarray:
         """
-        文本 → 嵌入向量
+        文本 → 嵌入向量 (L2 归一化)
         Args:
             texts: 单条或批量文本
         Returns:
-            [N, D] ndarray（单条时 N=1）
+            [N, D] ndarray（单条时 N=1，每行 L2 范数为 1.0）
         """
-        with torch.no_grad():
-            return self.model.encode(texts, normalize_embeddings=True)
 
     def embed_tensor(self, texts: Union[str, List[str]]) -> Tensor:
-        """同 embed()，返回 torch.Tensor [N, D]"""
+        """同 embed()，返回 torch.Tensor [N, D]（float32）"""
+
+    # 内部方法
+    def _embed_local(self, texts: List[str]) -> ndarray:
+        """sentence-transformers 本地推理，torch.no_grad() + normalize_embeddings=True"""
+
+    def _embed_remote(self, texts: List[str]) -> ndarray:
+        """OpenAI 兼容 API: client.embeddings.create() → 提取向量 → L2 归一化"""
 ```
 
-**依赖**: sentence-transformers, torch
+**远程模式示例** (GPUStack qwen3-embedding):
+```python
+# .env
+EMBED_API_KEY=sk-xxx
+EMBED_API_URL=http://gpu-host:8080/v1
+
+# config/default.yaml
+embed:
+  backend: "remote"
+  model_name: "qwen3-embedding-4b"
+  embed_dim: 2048
+  device: "cpu"       # 远程模式不使用
+  api_key: ""         # 从 .env 覆盖
+  api_url: ""         # 从 .env 覆盖
+```
+
+**依赖**: sentence-transformers（本地模式）, openai SDK（远程模式）, torch, numpy
 
 ---
 
