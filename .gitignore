@@ -1,3 +1,16 @@
 
 .gitnexus
 Reference/
+logs/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/.DS_Store
+**/.vscode/
+**/.idea/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.coverage
+**/.coverage.*
+**/.env
+**/.venv
