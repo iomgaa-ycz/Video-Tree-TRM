@@ -521,13 +521,13 @@ answer_generator.py               → answer_generator.py     不变
 config.py                         → config.py               全面重构
 
 新增:
-  + tree_index.py                 统一数据结构
-  + embeddings.py                 嵌入服务封装
-  + llm_client.py                 LLM/VLM 客户端
-  + text_tree_builder.py          文本模式预处理
-  + video_tree_builder.py         视频模式预处理
-  + recursive_retriever.py        TRM 递归检索器 (CA + MLP + ACT)
-  + losses.py                     NavigationLoss + ACTLoss
-  + train.py                      两阶段训练入口
-  + main.py                       推理/演示入口
+  + tree_index.py                 统一数据结构              ✅ 已实现
+  + embeddings.py                 嵌入服务封装              ✅ 已实现
+  + llm_client.py                 LLM/VLM 客户端            ✅ 已实现
+  + text_tree_builder.py          文本模式预处理            ✅ 已实现
+  + video_tree_builder.py         视频模式预处理            ⬜ 待实现
+  + recursive_retriever.py        TRM 递归检索器 (CA+MLP+ACT) ⬜ 待实现
+  + losses.py                     NavigationLoss + ACTLoss  ⬜ 待实现
+  + train.py                      两阶段训练入口            ⬜ 待实现
+  + main.py                       推理/演示入口             ⬜ 待实现
 ```

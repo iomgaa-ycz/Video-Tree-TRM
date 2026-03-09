@@ -253,62 +253,99 @@ class LLMClient:
 
 ### 1.4 text_tree_builder.py — 文本树构建
 
+> **状态**: ✅ 已实现 | 测试: `tests/unit/test_text_tree_builder.py`（43 个用例全部通过）
+
 **文件**: `video_tree_trm/text_tree_builder.py`
 **职责**: 长文本 → TreeIndex，实现 L2 轴心构建策略。
+
+#### 公共接口
 
 ```python
 class TextTreeBuilder:
     """文本模态树构建器"""
 
     def __init__(self, embed_model: EmbeddingModel, llm: LLMClient, config: TreeConfig):
-        self.embed = embed_model
-        self.llm = llm
-        self.config = config
+        self.embed = embed_model   # 冻结嵌入模型
+        self.llm = llm             # LLM 客户端
+        self.config = config       # TreeConfig（关键字段: max_paragraphs_per_l2）
 
     def build(self, text: str, source_path: str) -> TreeIndex:
         """
         完整构建流程:
-          Step 1: 结构切分 → L1/L2 边界
-          Step 2: L2 先行 → LLM 摘要 + 嵌入
-          Step 3: L3 向下 → 原始段落 + 嵌入
-          Step 4: L1 向上 → 聚合 L2 摘要 + 嵌入
-          Step 5: 组装 TreeIndex
-        """
-
-    # ── 内部方法 ──
-
-    def _segment_text(self, text: str) -> List[List[str]]:
-        """
-        Step 1: 结构切分
-        Returns:
-            sections[i] = [paragraph_1, paragraph_2, ...]
-            外层 = L1 段, 内层段落组 = L2 单元
-        策略:
-            有 ToC → 正则解析章节标题
-            无 ToC → LLM 单次调用语义分段
-        """
-
-    def _build_l2(self, paragraphs: List[str]) -> L2Node:
-        """
-        Step 2: 段落组 → L2 节点
-        prompt: "用1-2句话描述以下段落的核心内容，与同级小节形成区分: {text}"
-        """
-
-    def _build_l3_from_paragraphs(self, paragraphs: List[str]) -> List[L3Node]:
-        """
-        Step 3: 每个段落 → L3 节点
-        description = raw_content = 原始段落文本（不做摘要）
-        embedding = text_embed(段落文本)
-        """
-
-    def _build_l1(self, l2_children: List[L2Node]) -> L1Node:
-        """
-        Step 4: 聚合 L2 描述 → L1 摘要
-        prompt: "总结以下小节(2-3句): {l2_descriptions}"
+          Phase 1: _segment_text()  → sections: List[List[str]]
+          Phase 2: llm.batch_chat() → 所有 L2 摘要并发生成（一次调用）
+          Phase 3: 逐层组装 L3 → L2 → L1 节点
+          Phase 5: 组装 TreeIndex + 写日志
         """
 ```
 
-**依赖**: tree_index, embeddings, llm_client
+#### 内部方法
+
+```python
+    def _segment_text(self, text: str) -> List[List[str]]:
+        """调度: _detect_toc() → True → _segment_with_regex()
+                                → False → _segment_with_llm()
+        返回: sections[i] = [para_1, para_2, ...]
+              外层 = L1 章节，内层 = 该章节下所有段落（扁平）
+        注: build() 负责按 max_paragraphs_per_l2 等长分块为 L2 组"""
+
+    def _detect_toc(self, text: str) -> bool:
+        """检测文本是否含 # 或 ## 开头的 Markdown 标题行（正则: ^#{1,2}\s+\S）"""
+
+    def _segment_with_regex(self, text: str) -> List[List[str]]:
+        """正则解析 #/## 标题边界:
+          # → L1 切换（flush 当前 section）
+          ## → 段落分隔（flush 当前段落，标题文本作为一段）
+          空行 → 段落分隔
+          ### 及以下 → 视为普通段落内容"""
+
+    def _segment_with_llm(self, text: str) -> List[List[str]]:
+        """LLM 单次调用语义分段，返回只有一个外层元素的 list（整篇视为单 L1）
+        Prompt: '将以下文本分成若干语义段落...只返回 JSON 数组...'
+        解析: json.loads()，失败时通过 ensure() 抛 ValueError
+        支持 LLM 返回值被 markdown 代码块包裹（正则提取）"""
+
+    def _collect_paragraphs(self, text: str) -> List[str]:
+        """保底策略: 按双换行符切分段落（_segment_with_regex 无结果时兜底）"""
+
+    def _build_l2(self, paragraphs: List[str], l2_id: str) -> L2Node:
+        """段落组 → L2Node（不含 children，由 build() 填充）
+        LLM prompt: _L2_PROMPT.format(text="\n\n".join(paragraphs))
+        注: 实际由 build() 统一调 batch_chat() 批量处理，此方法仅供单独调用"""
+
+    def _build_l3_from_paragraphs(
+        self, paragraphs: List[str], l1_i: int, l2_j: int
+    ) -> List[L3Node]:
+        """段落列表批量嵌入 → L3Node 列表（不调用 LLM）
+        description = raw_content = 原始段落文本
+        embed.embed(paragraphs) 一次调用获取全部向量 [N, D]
+        节点 ID: f"l1_{l1_i}_l2_{l2_j}_l3_{k}" """
+
+    def _build_l1(self, l2_children: List[L2Node], l1_id: str) -> L1Node:
+        """聚合所有 L2 描述 → L1Node（含 children）
+        LLM prompt: _L1_PROMPT.format(l2_descriptions="1. ...\n2. ...")
+        节点 ID: f"l1_{l1_i}" """
+```
+
+#### 关键实现决策
+
+| 决策 | 说明 |
+|------|------|
+| **批量 LLM** | `build()` 收集所有 L2 段落组后调用 `llm.batch_chat()` 一次并发生成所有 L2 摘要，避免串行延迟 |
+| **L2 等长分块** | 当段落数超过 `max_paragraphs_per_l2` 时，`_chunk(lst, size)` 等长切块（固定步长无重叠），同一 `#` 章节下可产生多个 L2 |
+| **L3 无 LLM** | L3 直接复用原始段落文本（`description == raw_content`），`embed.embed()` 批量调用 |
+| **节点 ID** | `l1_{i}` / `l1_{i}_l2_{j}` / `l1_{i}_l2_{j}_l3_{k}`，全局唯一 |
+| **Prompt 常量** | `_L2_PROMPT`, `_L1_PROMPT`, `_SEG_PROMPT` 定义在模块顶层 |
+
+#### Prompt 设计
+
+```python
+_L2_PROMPT = "用1-2句话描述以下段落的核心内容，与同级小节形成区分:\n\n{text}"
+_L1_PROMPT = "用2-3句话总结以下小节的核心内容:\n\n{l2_descriptions}"
+_SEG_PROMPT = "将以下文本分成若干语义段落，每段为完整语义单元。\n只返回 JSON 数组，格式: [\"段落1\", ...]，不要其他内容。\n文本:\n\n{text}"
+```
+
+**依赖**: `tree_index`, `embeddings`, `llm_client`, `utils.logger_system`
 
 ---
 
@@ -1118,14 +1155,19 @@ Video-Tree-TRM/
 ├── config/
 │   └── default.yaml                  # 默认配置
 ├── tests/
+│   ├── conftest.py                   # 全局 fixture（real_config, 代理修复）
 │   ├── unit/
-│   │   ├── test_tree_index.py
+│   │   ├── test_config.py            # ✅ 已实现
+│   │   ├── test_embeddings.py        # ✅ 已实现
+│   │   ├── test_llm_client.py        # ✅ 已实现
+│   │   ├── test_tree_index.py        # ✅ 已实现
+│   │   ├── test_text_tree_builder.py # ✅ 已实现（43 用例）
 │   │   ├── test_recursive_retriever.py
 │   │   └── test_losses.py
 │   ├── integration/
-│   │   ├── test_text_tree_builder.py
 │   │   └── test_pipeline.py
 │   └── outputs/                      # Agent 测试 MD 输出
+│       └── text_tree_builder/        # ✅ build_toc_*.md
 ├── data/                             # 数据集（不提交）
 ├── cache/                            # TreeIndex 缓存（不提交）
 ├── checkpoints/                      # 模型权重（不提交）
