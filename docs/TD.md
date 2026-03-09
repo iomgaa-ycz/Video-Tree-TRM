@@ -171,40 +171,83 @@ embed:
 ### 1.3 llm_client.py — LLM/VLM 客户端
 
 **文件**: `video_tree_trm/llm_client.py`
-**职责**: 统一封装 LLM（纯文本）和 VLM（多模态）API 调用，支持多后端。
+**职责**: 统一封装 LLM（纯文本）和 VLM（多模态）API 调用，仅支持 OpenAI-compatible 单一接口，通过配置 `api_url` + `model` 切换服务商（Qwen DashScope、OpenAI、本地推理服务等）。
 
 ```python
 class LLMClient:
-    """LLM/VLM API 统一客户端"""
+    """OpenAI-compatible LLM/VLM 统一客户端。"""
 
-    def __init__(self, backend: str, api_key: str, model: str, **kwargs):
+    def __init__(self, config: Union[LLMConfig, VLMConfig]) -> None:
         """
+        初始化客户端。
         Args:
-            backend: "qwen" | "openai" | "ollama"
-            api_key: API 密钥（从 .env 读取）
-            model: 模型名称
+            config: LLMConfig 或 VLMConfig，含 api_key、api_url、model 等参数。
+        Raises:
+            ValueError: api_key 或 api_url 为空时抛出。
+        实现:
+            openai.OpenAI(api_key=config.api_key, base_url=config.api_url)
         """
 
-    def chat(self, prompt: str, max_tokens: int = 256) -> str:
-        """纯文本对话，返回生成文本"""
+    def chat(self, prompt: str, max_tokens: Optional[int] = None) -> str:
+        """纯文本单轮对话，返回生成文本。max_tokens=None 时取 config.max_tokens。"""
 
     def chat_with_images(
-        self, prompt: str, images: List[str], max_tokens: int = 256
+        self, prompt: str, images: List[str], max_tokens: Optional[int] = None
     ) -> str:
         """
-        多模态对话（VLM）
+        多模态对话（VLM）。
         Args:
-            prompt: 文本指令
-            images: 图像路径列表或 base64 列表
+            prompt: 文本指令。
+            images: 图像列表，每项为本地文件路径或已编码的 data URI 字符串。
         Returns:
-            生成文本
+            生成文本。
+        实现:
+            本地路径 → _encode_image() 转 base64 → _build_messages() 拼 content → API 调用。
         """
 
-    def batch_chat(self, prompts: List[str], max_tokens: int = 256) -> List[str]:
-        """批量文本对话（并发或顺序）"""
+    def batch_chat(self, prompts: List[str], max_tokens: Optional[int] = None) -> List[str]:
+        """ThreadPoolExecutor(max_workers=8) 并发调用 chat()，保序返回。"""
+
+    # ── 私有辅助 ──
+
+    def _encode_image(self, path_or_b64: str) -> str:
+        """
+        本地路径 → "data:image/{jpeg|png};base64,<data>"。
+        已含 "base64," 标记则直接返回（不重复编码）。
+        """
+
+    def _build_messages(
+        self, prompt: str, images: Optional[List[str]] = None
+    ) -> List[Dict]:
+        """
+        无图像: [{"role": "user", "content": prompt}]
+        有图像: content 为列表，image_url 项在前，text 项在后。
+        """
 ```
 
-**依赖**: openai SDK（兼容 Qwen/OpenAI/Ollama 接口）, python-dotenv
+**消息结构（OpenAI-compatible）**:
+
+```python
+# 纯文本
+[{"role": "user", "content": prompt}]
+
+# 多模态（图在 text 之前）
+[{"role": "user", "content": [
+    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}},
+    {"type": "text", "text": prompt}
+]}]
+```
+
+**与 TD 原设计的差异**:
+
+| 项目 | 原设计 | 实际实现 |
+|------|--------|---------|
+| 构造器签名 | `(backend, api_key, model, **kwargs)` | `(config: Union[LLMConfig, VLMConfig])` — 与 EmbeddingModel 风格统一 |
+| 后端区分 | `"qwen" \| "openai" \| "ollama"` 分支 | 统一走 OpenAI-compatible，无后端分支 |
+| `max_tokens` 默认值 | 函数参数硬编码 `= 256` | `= None`，None 时取 `config.max_tokens` |
+| `batch_chat` 并发 | "并发或顺序" | `ThreadPoolExecutor(max_workers=8)` |
+
+**依赖**: openai SDK（≥1.0）, python-dotenv（间接，via config）
 
 ---
 

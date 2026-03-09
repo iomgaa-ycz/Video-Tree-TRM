@@ -6,6 +6,7 @@ Video-Tree-TRM 核心包
 
 from video_tree_trm.config import Config
 from video_tree_trm.embeddings import EmbeddingModel
+from video_tree_trm.llm_client import LLMClient
 from video_tree_trm.tree_index import (
     IndexMeta,
     L1Node,
@@ -17,6 +18,7 @@ from video_tree_trm.tree_index import (
 __all__ = [
     "Config",
     "EmbeddingModel",
+    "LLMClient",
     "IndexMeta",
     "L1Node",
     "L2Node",
