@@ -709,6 +709,7 @@ class ACTLoss(nn.Module):
 
 **文件**: `video_tree_trm/answer_generator.py`
 **职责**: 根据检索结果组装 context，调用 LLM/VLM 生成最终答案。
+**状态**: ✅ 已实现 | 测试: `tests/unit/test_answer_generator.py`（10 个用例全部通过）
 
 ```python
 @dataclass
@@ -1185,7 +1186,8 @@ Video-Tree-TRM/
 │   │   ├── test_tree_index.py        # ✅ 已实现
 │   │   ├── test_text_tree_builder.py # ✅ 已实现（43 用例）
 │   │   ├── test_recursive_retriever.py  # ✅ 已实现（17 用例）
-│   │   └── test_losses.py               # ✅ 已实现（13 用例）
+│   │   ├── test_losses.py               # ✅ 已实现（13 用例）
+│   │   └── test_answer_generator.py     # ✅ 已实现（10 用例）
 │   ├── integration/
 │   │   └── test_pipeline.py
 │   └── outputs/                      # Agent 测试 MD 输出

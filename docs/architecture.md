@@ -529,7 +529,7 @@ video_tree_trm.py (cosine路由)    → RecursiveRetriever      Cross-Attention+
 visual_projection.py              → 删除                    L3 全文本化
 video_indexer.py (CLIP encode)    → embeddings.py            统一 text_embed()
 pipeline.py                       → pipeline.py             适配新接口
-answer_generator.py               → answer_generator.py     不变
+answer_generator.py               → answer_generator.py     ✅ 已实现
 config.py                         → config.py               全面重构
 
 新增:
