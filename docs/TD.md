@@ -643,6 +643,7 @@ class RecursiveRetriever(nn.Module):
 
 **文件**: `video_tree_trm/losses.py`
 **职责**: 导航损失（cross-entropy）+ ACT halt 损失（Q-learning）。
+**状态**: ✅ 已实现 | 测试: `tests/unit/test_losses.py`（13 个用例全部通过）
 
 ```python
 class NavigationLoss(nn.Module):
@@ -1184,7 +1185,7 @@ Video-Tree-TRM/
 │   │   ├── test_tree_index.py        # ✅ 已实现
 │   │   ├── test_text_tree_builder.py # ✅ 已实现（43 用例）
 │   │   ├── test_recursive_retriever.py  # ✅ 已实现（17 用例）
-│   │   └── test_losses.py
+│   │   └── test_losses.py               # ✅ 已实现（13 用例）
 │   ├── integration/
 │   │   └── test_pipeline.py
 │   └── outputs/                      # Agent 测试 MD 输出

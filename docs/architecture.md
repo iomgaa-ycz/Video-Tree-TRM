@@ -539,7 +539,7 @@ config.py                         → config.py               全面重构
   + text_tree_builder.py          文本模式预处理            ✅ 已实现
   + video_tree_builder.py         视频模式预处理            ✅ 已实现
   + recursive_retriever.py        TRM 递归检索器 (CA+MLP+ACT) ✅ 已实现
-  + losses.py                     NavigationLoss + ACTLoss  ⬜ 待实现
+  + losses.py                     NavigationLoss + ACTLoss  ✅ 已实现
   + train.py                      两阶段训练入口            ⬜ 待实现
   + main.py                       推理/演示入口             ⬜ 待实现
 ```
