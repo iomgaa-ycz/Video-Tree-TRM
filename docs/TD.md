@@ -981,7 +981,8 @@ VLM_API_KEY=sk-xxx
 
 ## 2. 训练管线
 
-**文件**: `train.py`
+**文件**: `train.py`（项目根目录）
+**状态**: ✅ 已实现 | 测试: `tests/unit/test_train.py`（13 个用例全部通过）
 
 ### 2.1 数据准备
 
@@ -1189,7 +1190,8 @@ Video-Tree-TRM/
 │   │   ├── test_recursive_retriever.py  # ✅ 已实现（17 用例）
 │   │   ├── test_losses.py               # ✅ 已实现（13 用例）
 │   │   ├── test_answer_generator.py     # ✅ 已实现（10 用例）
-│   │   └── test_pipeline.py             # ✅ 已实现（10 用例）
+│   │   ├── test_pipeline.py             # ✅ 已实现（10 用例）
+│   │   └── test_train.py                # ✅ 已实现（13 用例）
 │   ├── integration/
 │   └── outputs/                      # Agent 测试 MD 输出
 │       └── text_tree_builder/        # ✅ build_toc_*.md
