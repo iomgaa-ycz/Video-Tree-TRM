@@ -1,9 +1,9 @@
 tree:
   max_paragraphs_per_l2: 5
   l1_segment_duration: 600.0
-  l2_clip_duration: 20.0
+  l2_clip_duration: 60.0
   l3_fps: 1.0
-  l2_representative_frames: 3
+  l2_representative_frames: 10
   cache_dir: "cache/trees"
 
 embed:

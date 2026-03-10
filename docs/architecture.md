@@ -186,56 +186,65 @@ Pipeline:
 
 ### 4.4 VideoTreeBuilder
 
+**状态**: ✅ 已实现（`video_tree_trm/video_tree_builder.py`）
+
 ```
-输入: 长视频文件
+输入: 长视频文件路径
 输出: TreeIndex
 
 Pipeline:
-  Step 1 — 时间切分
-     场景检测 或 固定步长 → L1/L2 时间边界
-     L1 区间 ⊃ 多个 L2 区间
+  Step 1 — 时间切分（固定步长）
+     OpenCV 读取总时长 → 固定步长 l1_segment_duration=600s → L1 区间列表
+     每个 L1 区间 → 等分 l2_clip_duration=60s → L2 clips
 
-  Step 2 — L2 先行（廉价）
-     每个 L2 clip: 采样 2-3 张代表帧 → VLM 生成片段描述 (1-2句)
+  Step 2 — L2 先行（稀疏代表帧）
+     每个 L2 clip: 均匀 seek l2_representative_frames=10 个时间戳提取帧
+     （稀疏采样，独立于 l3_fps，直接 cv2 seek，不做全量提取）
+     → VLM(10帧, "描述片段核心内容") → 1-2句描述
      → text_embed(描述)
-     描述目标: 与兄弟 L2 形成区分
 
-  Step 3 — L3 向下（贵，批量 + L2 上下文）
-     每个 L2 clip 内的帧: 注入 L2 描述 → VLM 批量帧描述 (1-2句/帧)
-     → text_embed(帧描述)
-     存储 frame_path = 帧图像路径
+  Step 3 — L3 向下（密集帧 + L2 上下文）
+     每个 L2 clip: 按 l3_fps=1.0 fps 提取全量帧
+     帧文件持久化到 {cache_dir}/frames/{video_stem}/（缓存复用）
+     主路径: VLM(全部帧, prompt) → JSON 数组（每帧1-2句）→ text_embed
+     降级路径: JSON 解析失败 → 逐帧 VLM 调用
 
-  Step 4 — L1 向上聚合（廉价）
-     每个 L1: LLM("总结这些片段: " + 所有子 L2 描述) → text_embed(摘要)
-     摘要目标: 覆盖下属所有 L2 的语义范围 (2-3句)
+  Step 4 — L1 向上聚合（纯文本）
+     每个 L1: vlm.chat(拼接所有 L2 描述) → 2-3句摘要
+     → text_embed(摘要)
 
-  Step 5 — 序列化 → TreeIndex
+  Step 5 — 组装 TreeIndex（写 IndexMeta + 日志）
 ```
 
-**L3 帧描述的 prompt 设计**（继承 L2 上下文 + 批量处理）：
+**L2 代表帧采样**（均匀 seek，首尾均包含）：
 
 ```python
-# L2 描述已在 Step 2 生成，作为 L3 的上下文注入
-prompt = f"""
-该片段的整体内容: "{l2_description}"
-以下是该片段中连续的 {N} 帧画面。
-对每帧用一到两句话描述其具体画面内容。
-重点关注: 动作、物体变化、文字信息、人物表情。
-不要重复片段整体描述，聚焦每帧的区分性信息。
-"""
-descs = VLM(frames_batch, prompt)  # 一次调用描述 N 帧
+step = (end_sec - start_sec) / (n_rep - 1)
+timestamps = [start_sec + i * step for i in range(n_rep)]
+# → 直接 cap.set(CAP_PROP_POS_MSEC, ts * 1000) 提取，缓存为 l2_{ts:.3f}.jpg
 ```
 
-**L1 摘要的 prompt 设计**（聚合 L2 描述）：
+**L3 帧描述 prompt**（继承 L2 上下文 + 要求 JSON 输出）：
+
+```python
+prompt = (
+    '该片段的整体内容: "{l2_description}"\n'
+    "以下是该片段中连续的 {n} 帧画面。\n"
+    "对每帧用一到两句话描述其具体画面内容。\n"
+    "重点关注: 动作、物体变化、文字信息、人物表情。\n"
+    "不要重复片段整体描述，聚焦每帧的区分性信息。\n"
+    '只返回 JSON 数组，格式: ["帧1描述", "帧2描述", ...]，不要其他内容。'
+)
+descs = VLM(frames_batch, prompt)  # 主路径：一次调用，JSON 解析
+# 降级：json.loads 失败 → 逐帧调用
+```
+
+**L1 摘要 prompt**：
 
 ```python
 l2_texts = "\n".join(f"- {node.description}" for node in l2_children)
-prompt = f"""
-以下是一个视频段落中各片段的描述:
-{l2_texts}
-用2-3句话总结该段落的整体内容，涵盖所有片段的主题。
-"""
-l1_summary = LLM(prompt)
+prompt = f"以下是一个视频段落中各片段的描述:\n{l2_texts}\n用2-3句话总结该段落的整体内容，涵盖所有片段的主题。"
+l1_summary = vlm.chat(prompt)  # 纯文本调用
 ```
 
 ---
