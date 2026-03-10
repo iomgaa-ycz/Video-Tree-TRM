@@ -302,7 +302,8 @@ L_level 推理模块使用 **MLP-based**（RMSNorm + SwiGLU），操作对象为
 │  │                                                           │
 │  │  ┌─── ACT Halt Decision ───────────────────┐             │
 │  │  │ halt_logit = q_head(z)                   │             │
-│  │  │ if halt_logit > 0: break                 │             │
+│  │  │ if halt_logit > 0 and round_idx > 0:     │             │
+│  │  │     break  # 至少跑 1 轮                  │             │
 │  │  └──────────────────────────────────────────┘             │
 │  │                                                           │
 │  └── z 状态保留到下一轮（累积已检索信息）                     │
@@ -324,21 +325,23 @@ class RecursiveRetriever:
         self.L_cycles = L_cycles
         self.max_rounds = max_rounds
 
-    def retrieve(self, q: Tensor, tree: TreeIndex) -> List[Path]:
-        z = q.clone()                   # [B, D]
-        collected = []
+    def forward(
+        self, q: Tensor, tree: TreeIndex, return_internals: bool = False
+    ) -> Dict[str, Any]:
+        z = q.clone()                   # [B, D]，初始潜在状态 = 查询嵌入
+        paths = []
 
         for round_idx in range(self.max_rounds):
             # ── 三阶段树遍历（一次完整 root-to-leaf） ──
-            path, z = self._traverse_one_path(q, z, tree)
-            collected.append(path)
+            path, z, step_attns = self._traverse_one_path(q, z, tree)
+            paths.append(path)
 
-            # ── ACT halt ──
-            halt_logit = self.q_head(z)
-            if halt_logit > 0 and round_idx > 0:  # 至少走一轮
+            # ── ACT halt（推理模式，至少走 1 轮） ──
+            halt_logit = self.q_head(z)  # [B, 1]
+            if not self.training and halt_logit.item() > 0 and round_idx > 0:
                 break
 
-        return collected
+        return {"paths": paths, "num_rounds": len(paths), "z_final": z}
 
     def _traverse_one_path(self, q, z, tree):
         """单次 root → L1 → L2 → L3 遍历。"""
@@ -534,8 +537,8 @@ config.py                         → config.py               全面重构
   + embeddings.py                 嵌入服务封装              ✅ 已实现
   + llm_client.py                 LLM/VLM 客户端            ✅ 已实现
   + text_tree_builder.py          文本模式预处理            ✅ 已实现
-  + video_tree_builder.py         视频模式预处理            ⬜ 待实现
-  + recursive_retriever.py        TRM 递归检索器 (CA+MLP+ACT) ⬜ 待实现
+  + video_tree_builder.py         视频模式预处理            ✅ 已实现
+  + recursive_retriever.py        TRM 递归检索器 (CA+MLP+ACT) ✅ 已实现
   + losses.py                     NavigationLoss + ACTLoss  ⬜ 待实现
   + train.py                      两阶段训练入口            ⬜ 待实现
   + main.py                       推理/演示入口             ⬜ 待实现

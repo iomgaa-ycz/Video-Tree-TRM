@@ -436,6 +436,7 @@ class VideoTreeBuilder:
 
 **文件**: `video_tree_trm/recursive_retriever.py`
 **职责**: 核心可训练模型。Cross-Attention 节点选择 + MLP 推理 + ACT halt。
+**状态**: ✅ 已实现 | 测试: `tests/unit/test_recursive_retriever.py`（17 个用例全部通过）
 
 #### 1.6.1 CrossAttentionSelector
 
@@ -1182,7 +1183,7 @@ Video-Tree-TRM/
 │   │   ├── test_llm_client.py        # ✅ 已实现
 │   │   ├── test_tree_index.py        # ✅ 已实现
 │   │   ├── test_text_tree_builder.py # ✅ 已实现（43 用例）
-│   │   ├── test_recursive_retriever.py
+│   │   ├── test_recursive_retriever.py  # ✅ 已实现（17 用例）
 │   │   └── test_losses.py
 │   ├── integration/
 │   │   └── test_pipeline.py
