@@ -755,6 +755,7 @@ class AnswerGenerator:
 
 **文件**: `video_tree_trm/pipeline.py`
 **职责**: 串联 预处理 → 检索 → 生成 的完整推理流程。
+**状态**: ✅ 已实现 | 测试: `tests/unit/test_pipeline.py`（10 个用例全部通过）
 
 ```python
 class Pipeline:
@@ -1187,9 +1188,9 @@ Video-Tree-TRM/
 │   │   ├── test_text_tree_builder.py # ✅ 已实现（43 用例）
 │   │   ├── test_recursive_retriever.py  # ✅ 已实现（17 用例）
 │   │   ├── test_losses.py               # ✅ 已实现（13 用例）
-│   │   └── test_answer_generator.py     # ✅ 已实现（10 用例）
+│   │   ├── test_answer_generator.py     # ✅ 已实现（10 用例）
+│   │   └── test_pipeline.py             # ✅ 已实现（10 用例）
 │   ├── integration/
-│   │   └── test_pipeline.py
 │   └── outputs/                      # Agent 测试 MD 输出
 │       └── text_tree_builder/        # ✅ build_toc_*.md
 ├── data/                             # 数据集（不提交）
