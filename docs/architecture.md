@@ -161,7 +161,7 @@ L1: "厨师在厨房制作意大利面，从准备食材到最终装盘。"
 
 ```
 输入: 长文本文档
-输出: TreeIndex
+输出: TreeIndex（全部 embedding=None）
 
 Pipeline:
   Step 1 — 结构切分
@@ -169,19 +169,23 @@ Pipeline:
      无 ToC → LLM 语义分段 (一次性调用)
 
   Step 2 — L2 先行
-     L2: 段落组 → LLM 生成摘要 (1-2句) → text_embed(摘要)
+     L2: 段落组 → LLM 生成摘要 (1-2句)
          摘要目标: 与兄弟 L2 形成区分
+         （batch_chat 并发生成所有 L2 摘要）
 
   Step 3 — L3 向下
-     L3: 原始段落 → text_embed(段落文本)
-         存储 raw_content = 原始文本
-         （文本模式 L3 不需要 L2 上下文，直接使用原文）
+     L3: 原始段落文本直接复用
+         存储 raw_content = description = 原始文本
+         （文本模式 L3 不需要 L2 上下文，不调用 LLM）
 
   Step 4 — L1 向上聚合
-     L1: LLM("总结这些小节: " + 所有子 L2 摘要) → text_embed(摘要)
+     L1: LLM("总结这些小节: " + 所有子 L2 摘要) → 摘要
          摘要目标: 覆盖下属所有 L2 的语义范围 (2-3句)
 
-  Step 5 — 序列化 → TreeIndex
+  Step 5 — 序列化 → TreeIndex（JSON，无 embedding）
+
+  ⚠ 延迟 Embedding: 所有节点 embedding=None
+     首次检索时由 Pipeline._embed_tree() → tree.embed_all() 统一填充
 ```
 
 ### 4.4 VideoTreeBuilder
@@ -189,31 +193,38 @@ Pipeline:
 **状态**: ✅ 已实现（`video_tree_trm/video_tree_builder.py`）
 
 ```
-输入: 长视频文件路径
-输出: TreeIndex
+输入: 长视频文件路径 或 YouTube URL
+输出: TreeIndex（全部 embedding=None）
 
 Pipeline:
+  Step 0 — 输入类型判断
+     本地文件: 直接使用 OpenCV 读取
+     YouTube URL: yt-dlp -g 获取 CDN 直链 + yt-dlp --dump-json 获取时长
+
   Step 1 — 时间切分（固定步长）
-     OpenCV 读取总时长 → 固定步长 l1_segment_duration=600s → L1 区间列表
+     本地: cv2 读取总时长
+     HTTP 流: 使用 yt-dlp 元数据时长（duration_hint，避免 cv2 流上不可靠）
+     固定步长 l1_segment_duration=600s → L1 区间列表
      每个 L1 区间 → 等分 l2_clip_duration=60s → L2 clips
 
   Step 2 — L2 先行（稀疏代表帧）
      每个 L2 clip: 均匀 seek l2_representative_frames=10 个时间戳提取帧
      （稀疏采样，独立于 l3_fps，直接 cv2 seek，不做全量提取）
      → VLM(10帧, "描述片段核心内容") → 1-2句描述
-     → text_embed(描述)
 
   Step 3 — L3 向下（密集帧 + L2 上下文）
      每个 L2 clip: 按 l3_fps=1.0 fps 提取全量帧
-     帧文件持久化到 {cache_dir}/frames/{video_stem}/（缓存复用）
-     主路径: VLM(全部帧, prompt) → JSON 数组（每帧1-2句）→ text_embed
+     帧文件持久化到 {cache_dir}/frames/{source_id}/（缓存复用）
+     主路径: VLM(全部帧, prompt) → JSON 数组（每帧1-2句）
      降级路径: JSON 解析失败 → 逐帧 VLM 调用
 
   Step 4 — L1 向上聚合（纯文本）
      每个 L1: vlm.chat(拼接所有 L2 描述) → 2-3句摘要
-     → text_embed(摘要)
 
   Step 5 — 组装 TreeIndex（写 IndexMeta + 日志）
+
+  ⚠ 延迟 Embedding: 所有节点 embedding=None
+     首次检索时由 Pipeline._embed_tree() → tree.embed_all() 统一填充
 ```
 
 **L2 代表帧采样**（均匀 seek，首尾均包含）：
@@ -528,7 +539,7 @@ video_tree_trm.py (cosine路由)    → RecursiveRetriever      Cross-Attention+
   L_level (Transformer blocks)    → ReasoningModule          MLP-based (向量非序列)
 visual_projection.py              → 删除                    L3 全文本化
 video_indexer.py (CLIP encode)    → embeddings.py            统一 text_embed()
-pipeline.py                       → pipeline.py             ✅ 已实现
+pipeline.py                       → pipeline.py             ✅ 已实现（含延迟 embed 策略）
 answer_generator.py               → answer_generator.py     ✅ 已实现
 config.py                         → config.py               全面重构
 
