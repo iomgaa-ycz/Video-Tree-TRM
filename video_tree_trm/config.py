@@ -49,6 +49,7 @@ class TreeConfig:
     l3_fps: float
     l2_representative_frames: int
     cache_dir: str
+    concurrency: int
 
 
 @dataclass

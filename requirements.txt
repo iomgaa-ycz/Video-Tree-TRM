@@ -1,0 +1,21 @@
+# 核心
+torch>=2.0
+sentence-transformers>=2.2
+numpy
+
+# LLM/VLM
+openai>=1.0              # 兼容 Qwen/OpenAI/Ollama 接口
+python-dotenv
+
+# 视频处理
+opencv-python
+
+# 配置
+pyyaml
+
+# 测试
+pytest
+pytest-cov
+
+# 代码质量
+ruff

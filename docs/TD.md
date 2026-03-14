@@ -40,37 +40,39 @@
 **文件**: `video_tree_trm/tree_index.py`
 **职责**: 定义三层树索引的节点类型、序列化/反序列化、嵌入矩阵提取。
 
+> **延迟 Embedding 设计**：build 阶段所有节点 `embedding=None`，`IndexMeta.embed_model/embed_dim` 也为 None。首次检索前由 `Pipeline._embed_tree()` 调用 `embed_all()` 统一填充。
+
 ```python
 @dataclass
 class IndexMeta:
-    source_path: str           # 原始文件路径
-    modality: str              # "text" | "video"
-    embed_model: str           # 嵌入器名称, e.g. "BAAI/bge-base-zh-v1.5"
-    embed_dim: int             # 嵌入维度 D
-    created_at: str            # ISO 时间戳
+    source_path: str                   # 原始文件路径
+    modality: str                      # "text" | "video"
+    embed_model: Optional[str] = None  # build 时为 None，embed_all 后填充
+    embed_dim: Optional[int] = None    # build 时为 None，embed_all 后填充
+    created_at: str                    # ISO 时间戳（自动生成）
 
 @dataclass
 class L3Node:
     id: str
-    description: str           # 视频=VLM帧描述, 文本=原始段落
-    embedding: ndarray         # [D], text_embed(description)
-    raw_content: Optional[str] # 原始文本（文本模式）
-    frame_path: Optional[str]  # 帧图像路径（视频模式）
-    timestamp: Optional[float] # 帧时间戳（视频模式）
+    description: str              # 视频=VLM帧描述, 文本=原始段落
+    embedding: Optional[ndarray]  # [D]，build 时为 None，embed_all 后填充
+    raw_content: Optional[str]    # 原始文本（文本模式）
+    frame_path: Optional[str]     # 帧图像路径（视频模式）
+    timestamp: Optional[float]    # 帧时间戳（视频模式）
 
 @dataclass
 class L2Node:
     id: str
-    description: str           # 1-2句片段描述
-    embedding: ndarray         # [D]
+    description: str              # 1-2句片段描述
+    embedding: Optional[ndarray]  # [D]，build 时为 None
     time_range: Optional[Tuple[float, float]]
     children: List[L3Node]
 
 @dataclass
 class L1Node:
     id: str
-    summary: str               # 2-3句聚合摘要
-    embedding: ndarray         # [D]
+    summary: str                  # 2-3句聚合摘要
+    embedding: Optional[ndarray]  # [D]，build 时为 None
     time_range: Optional[Tuple[float, float]]
     children: List[L2Node]
 
@@ -84,8 +86,23 @@ class TreeIndex:
 
 ```python
 class TreeIndex:
+    @property
+    def is_embedded(self) -> bool:
+        """所有 L1/L2/L3 节点的 embedding 均非 None 时返回 True"""
+
+    def embed_all(
+        self,
+        embed_fn: Callable[[Union[str, List[str]]], ndarray],
+        model_name: str,
+        embed_dim: int,
+    ) -> None:
+        """批量 embed 所有节点，更新 metadata。
+        - L3 按 L2 分组批量调用（减少 API 调用次数）
+        - L1/L2 各单独 embed
+        - 仅对 embedding=None 的节点执行（支持增量更新）"""
+
     def l1_embeddings(self) -> ndarray:
-        """返回所有 L1 嵌入矩阵 [N1, D]"""
+        """返回所有 L1 嵌入矩阵 [N1, D]（需先 embed_all）"""
 
     def l2_embeddings_of(self, l1_idx: int) -> ndarray:
         """返回指定 L1 下所有 L2 子节点嵌入 [N2, D]"""
@@ -96,15 +113,24 @@ class TreeIndex:
     def get_node(self, l1: int, l2: int, l3: int) -> L3Node:
         """按路径索引获取 L3 节点"""
 
+    # JSON 序列化（主格式，无 embedding，适合缓存和人工查看）
+    def save_json(self, path: str) -> None:
+        """序列化为 JSON 文件（不含 embedding 向量）"""
+
+    @classmethod
+    def load_json(cls, path: str) -> "TreeIndex":
+        """从 JSON 文件加载（embedding=None，需后续 embed_all）"""
+
+    # pickle 序列化（向后兼容，含 embedding）
     def save(self, path: str) -> None:
-        """pickle 序列化到文件"""
+        """pickle 序列化（含 embedding 向量）"""
 
     @classmethod
     def load(cls, path: str) -> "TreeIndex":
-        """从文件反序列化"""
+        """从 pickle 文件加载"""
 ```
 
-**依赖**: numpy, pickle（标准库）
+**依赖**: numpy, pickle, json（标准库）
 
 ---
 
@@ -238,77 +264,148 @@ class LLMClient:
 ]}]
 ```
 
+**502/503 自动重试机制**:
+
+```python
+# 模块级辅助函数
+def _call_with_retry(fn, label: str):
+    """对 API 调用执行指数退避重试（仅重试 502/503）。
+    - 最多重试 20 次（约等待 20+ 分钟）
+    - 首次等待 60s，每次翻倍，上限 300s
+    """
+    wait = 60
+    for attempt in range(1, 21):
+        try:
+            return fn()
+        except openai.InternalServerError as exc:
+            if exc.status_code not in {502, 503}:
+                raise
+            time.sleep(wait)
+            wait = min(wait * 2, 300)
+```
+
+**代理绕过**:
+
+```python
+self._client = openai.OpenAI(
+    api_key=config.api_key,
+    base_url=config.api_url,
+    http_client=httpx.Client(proxy=None),  # 显式绕过系统代理，直连内网地址
+)
+```
+
 **与 TD 原设计的差异**:
 
 | 项目 | 原设计 | 实际实现 |
 |------|--------|---------|
-| 构造器签名 | `(backend, api_key, model, **kwargs)` | `(config: Union[LLMConfig, VLMConfig])` — 与 EmbeddingModel 风格统一 |
+| 构造器签名 | `(backend, api_key, model, **kwargs)` | `(config: Union[LLMConfig, VLMConfig])` |
 | 后端区分 | `"qwen" \| "openai" \| "ollama"` 分支 | 统一走 OpenAI-compatible，无后端分支 |
 | `max_tokens` 默认值 | 函数参数硬编码 `= 256` | `= None`，None 时取 `config.max_tokens` |
 | `batch_chat` 并发 | "并发或顺序" | `ThreadPoolExecutor(max_workers=8)` |
+| **重试** | 无 | `_call_with_retry()` 502/503 指数退避重试（新增） |
+| **代理** | 无 | `httpx.Client(proxy=None)` 绕过系统代理（新增） |
 
-**依赖**: openai SDK（≥1.0）, python-dotenv（间接，via config）
+**依赖**: openai SDK（≥1.0）, httpx, python-dotenv（间接，via config）
 
 ---
 
 ### 1.4 text_tree_builder.py — 文本树构建
 
+> **状态**: ✅ 已实现 | 测试: `tests/unit/test_text_tree_builder.py`（43 个用例全部通过）
+
 **文件**: `video_tree_trm/text_tree_builder.py`
 **职责**: 长文本 → TreeIndex，实现 L2 轴心构建策略。
+
+> **注意**: 构造器不接受 `EmbeddingModel`（延迟 embedding 设计）。所有节点 `embedding=None`，由 `Pipeline.embed_all()` 在检索前统一填充。
+
+#### 公共接口
 
 ```python
 class TextTreeBuilder:
     """文本模态树构建器"""
 
-    def __init__(self, embed_model: EmbeddingModel, llm: LLMClient, config: TreeConfig):
-        self.embed = embed_model
-        self.llm = llm
-        self.config = config
+    def __init__(self, llm: LLMClient, config: TreeConfig):
+        self.llm = llm             # LLM 客户端
+        self.config = config       # TreeConfig（关键字段: max_paragraphs_per_l2）
+        # ⚠ 无 embed_model：embedding 延迟到 Pipeline.embed_all()
 
     def build(self, text: str, source_path: str) -> TreeIndex:
         """
         完整构建流程:
-          Step 1: 结构切分 → L1/L2 边界
-          Step 2: L2 先行 → LLM 摘要 + 嵌入
-          Step 3: L3 向下 → 原始段落 + 嵌入
-          Step 4: L1 向上 → 聚合 L2 摘要 + 嵌入
-          Step 5: 组装 TreeIndex
-        """
-
-    # ── 内部方法 ──
-
-    def _segment_text(self, text: str) -> List[List[str]]:
-        """
-        Step 1: 结构切分
-        Returns:
-            sections[i] = [paragraph_1, paragraph_2, ...]
-            外层 = L1 段, 内层段落组 = L2 单元
-        策略:
-            有 ToC → 正则解析章节标题
-            无 ToC → LLM 单次调用语义分段
-        """
-
-    def _build_l2(self, paragraphs: List[str]) -> L2Node:
-        """
-        Step 2: 段落组 → L2 节点
-        prompt: "用1-2句话描述以下段落的核心内容，与同级小节形成区分: {text}"
-        """
-
-    def _build_l3_from_paragraphs(self, paragraphs: List[str]) -> List[L3Node]:
-        """
-        Step 3: 每个段落 → L3 节点
-        description = raw_content = 原始段落文本（不做摘要）
-        embedding = text_embed(段落文本)
-        """
-
-    def _build_l1(self, l2_children: List[L2Node]) -> L1Node:
-        """
-        Step 4: 聚合 L2 描述 → L1 摘要
-        prompt: "总结以下小节(2-3句): {l2_descriptions}"
+          Phase 1: _segment_text()  → sections: List[List[str]]
+          Phase 2: llm.batch_chat() → 所有 L2 摘要并发生成（一次调用）
+          Phase 3: 逐层组装 L3 → L2 → L1 节点
+          Phase 5: 组装 TreeIndex + 写日志
         """
 ```
 
-**依赖**: tree_index, embeddings, llm_client
+#### 内部方法
+
+```python
+    def _segment_text(self, text: str) -> List[List[str]]:
+        """调度: _detect_toc() → True → _segment_with_regex()
+                                → False → _segment_with_llm()
+        返回: sections[i] = [para_1, para_2, ...]
+              外层 = L1 章节，内层 = 该章节下所有段落（扁平）
+        注: build() 负责按 max_paragraphs_per_l2 等长分块为 L2 组"""
+
+    def _detect_toc(self, text: str) -> bool:
+        """检测文本是否含 # 或 ## 开头的 Markdown 标题行（正则: ^#{1,2}\s+\S）"""
+
+    def _segment_with_regex(self, text: str) -> List[List[str]]:
+        """正则解析 #/## 标题边界:
+          # → L1 切换（flush 当前 section）
+          ## → 段落分隔（flush 当前段落，标题文本作为一段）
+          空行 → 段落分隔
+          ### 及以下 → 视为普通段落内容"""
+
+    def _segment_with_llm(self, text: str) -> List[List[str]]:
+        """LLM 单次调用语义分段，返回只有一个外层元素的 list（整篇视为单 L1）
+        Prompt: '将以下文本分成若干语义段落...只返回 JSON 数组...'
+        解析: json.loads()，失败时通过 ensure() 抛 ValueError
+        支持 LLM 返回值被 markdown 代码块包裹（正则提取）"""
+
+    def _collect_paragraphs(self, text: str) -> List[str]:
+        """保底策略: 按双换行符切分段落（_segment_with_regex 无结果时兜底）"""
+
+    def _build_l2(self, paragraphs: List[str], l2_id: str) -> L2Node:
+        """段落组 → L2Node（不含 children，由 build() 填充）
+        LLM prompt: _L2_PROMPT.format(text="\n\n".join(paragraphs))
+        注: 实际由 build() 统一调 batch_chat() 批量处理，此方法仅供单独调用"""
+
+    def _build_l3_from_paragraphs(
+        self, paragraphs: List[str], l1_i: int, l2_j: int
+    ) -> List[L3Node]:
+        """段落列表批量嵌入 → L3Node 列表（不调用 LLM）
+        description = raw_content = 原始段落文本
+        embed.embed(paragraphs) 一次调用获取全部向量 [N, D]
+        节点 ID: f"l1_{l1_i}_l2_{l2_j}_l3_{k}" """
+
+    def _build_l1(self, l2_children: List[L2Node], l1_id: str) -> L1Node:
+        """聚合所有 L2 描述 → L1Node（含 children）
+        LLM prompt: _L1_PROMPT.format(l2_descriptions="1. ...\n2. ...")
+        节点 ID: f"l1_{l1_i}" """
+```
+
+#### 关键实现决策
+
+| 决策 | 说明 |
+|------|------|
+| **批量 LLM** | `build()` 收集所有 L2 段落组后调用 `llm.batch_chat()` 一次并发生成所有 L2 摘要，避免串行延迟 |
+| **L2 等长分块** | 当段落数超过 `max_paragraphs_per_l2` 时，`_chunk(lst, size)` 等长切块（固定步长无重叠），同一 `#` 章节下可产生多个 L2 |
+| **L3 无 LLM** | L3 直接复用原始段落文本（`description == raw_content`），`embed.embed()` 批量调用 |
+| **节点 ID** | `l1_{i}` / `l1_{i}_l2_{j}` / `l1_{i}_l2_{j}_l3_{k}`，全局唯一 |
+| **Prompt 常量** | `_L2_PROMPT`, `_L1_PROMPT`, `_SEG_PROMPT` 定义在模块顶层 |
+
+#### Prompt 设计
+
+```python
+_L2_PROMPT = "用1-2句话描述以下段落的核心内容，与同级小节形成区分:\n\n{text}"
+_L1_PROMPT = "用2-3句话总结以下小节的核心内容:\n\n{l2_descriptions}"
+_SEG_PROMPT = "将以下文本分成若干语义段落，每段为完整语义单元。\n只返回 JSON 数组，格式: [\"段落1\", ...]，不要其他内容。\n文本:\n\n{text}"
+```
+
+**依赖**: `tree_index`, `embeddings`, `llm_client`, `utils.logger_system`
 
 ---
 
@@ -316,60 +413,125 @@ class TextTreeBuilder:
 
 **文件**: `video_tree_trm/video_tree_builder.py`
 **职责**: 长视频 → TreeIndex，实现 L2 轴心构建策略 + VLM 帧描述。
+**状态**: ✅ 已实现
+
+> **注意**: 构造器不接受 `EmbeddingModel`（延迟 embedding 设计）。所有节点 `embedding=None`，由 `Pipeline.embed_all()` 在检索前统一填充。支持本地文件路径和 YouTube URL 两种输入。
 
 ```python
 class VideoTreeBuilder:
     """视频模态树构建器"""
 
-    def __init__(self, embed_model: EmbeddingModel, vlm: LLMClient, config: TreeConfig):
-        self.embed = embed_model
+    def __init__(self, vlm: LLMClient, config: TreeConfig):
         self.vlm = vlm
         self.config = config
+        # ⚠ 无 embed_model：embedding 延迟到 Pipeline.embed_all()
 
     def build(self, video_path: str) -> TreeIndex:
         """
-        完整构建流程:
-          Step 1: 时间切分 → L1/L2 时间边界
-          Step 2: L2 先行 → 代表帧 VLM 描述 + 嵌入
-          Step 3: L3 向下 → 注入 L2 上下文 VLM 帧描述 + 嵌入
-          Step 4: L1 向上 → 聚合 L2 描述 + 嵌入
-          Step 5: 组装 TreeIndex
+        支持本地文件路径或 YouTube URL。
+          URL 模式: _resolve_stream() 获取 CDN 直链，_get_video_duration() 获取时长
+          本地模式: OpenCV 直接读取
+
+        完整构建流程（ThreadPoolExecutor 异步事件循环）:
+          Step 0: URL 处理（若 video_path 为 URL）
+          Step 1: _segment_video  → L1 时间区间列表
+          Step 2: 收集全局 L2 任务列表，预计算每个 L1 的 L2 数量
+          Step 3: ThreadPoolExecutor(max_workers=concurrency) 一次性提交所有 L2 任务（非阻塞）
+          Step 4: 事件循环（cfwait FIRST_COMPLETED）：
+                  L2 完成 → 立即提交 L3 任务（_build_l3_task）
+                  L3 完成 → 检查 L1 就绪 → 立即提交 L1 任务
+                  L1 完成 → 收集结果
+          Step 5: 有序重建 l1_nodes，组装 TreeIndex（全部 embedding=None）
+
+        主线程单线程操作 l1_l2_buckets，无竞争，无需 Lock。
         """
+
+    # ── URL 流式辅助方法（静态方法）──
+
+    @staticmethod
+    def _is_url(path_or_url: str) -> bool:
+        """判断输入是否为 http/https URL"""
+
+    @staticmethod
+    def _source_stem(video_path: str) -> str:
+        """提取短标识符用于帧缓存目录：
+        YouTube URL → 视频 ID（v= 参数）；本地文件 → stem（限 64 字符）"""
+
+    @staticmethod
+    def _resolve_stream(url: str) -> str:
+        """yt-dlp -g 获取 YouTube CDN 直链（不下载，仅元数据）"""
+
+    @staticmethod
+    def _get_video_duration(url: str) -> float:
+        """yt-dlp --dump-json 获取视频时长（cv2 在 HTTP 流上 CAP_PROP_FRAME_COUNT 不可靠）"""
 
     # ── 内部方法 ──
 
-    def _segment_video(self, video_path: str) -> List[Tuple[float, float]]:
-        """
-        Step 1: 视频 → L1 时间区间列表
-        策略: 固定步长 l1_segment_duration 或场景检测
-        """
+    def _segment_video(
+        self, video_path: str, duration_hint: Optional[float] = None
+    ) -> List[Tuple[float, float]]:
+        """固定步长切分 L1 区间。
+        本地文件: cv2 读取总时长；HTTP 流: 使用 duration_hint"""
 
-    def _extract_frames(self, video_path: str, time_range: Tuple[float, float], fps: float) -> List[Tuple[str, float]]:
-        """
-        提取指定时间范围内的帧
-        Returns: [(frame_path, timestamp), ...]
-        """
+    def _get_l2_clips(self, l1_range: Tuple[float, float]) -> List[Tuple[float, float]]:
+        """将 L1 区间按 l2_clip_duration 等分为 L2 clips"""
 
-    def _build_l2_video(self, video_path: str, clip_range: Tuple[float, float]) -> L2Node:
-        """
-        Step 2: 每个 L2 clip → 采样 2-3 张代表帧 → VLM 描述 (1-2句)
-        """
+    def _extract_frames(
+        self, video_path: str, time_range: Tuple[float, float], fps: float,
+        source_id: Optional[str] = None
+    ) -> List[Tuple[str, float]]:
+        """L3 专用：按 fps 密集提取帧到 {cache_dir}/frames/{source_id}/
+        已存在的帧文件自动跳过（缓存复用）"""
 
-    def _build_l3_video(self, frames: List[Tuple[str, float]], l2_description: str) -> List[L3Node]:
-        """
-        Step 3: 注入 L2 上下文的 VLM 批量帧描述
-        prompt = f'''
-        该片段的整体内容: "{l2_description}"
-        以下是该片段中连续的 {N} 帧画面。
-        对每帧用一到两句话描述其具体画面内容。
-        重点关注: 动作、物体变化、文字信息、人物表情。
-        不要重复片段整体描述，聚焦每帧的区分性信息。
-        '''
-        """
+    def _build_l2_video(
+        self, video_path: str, clip_range: Tuple[float, float], l2_id: str,
+        source_id: Optional[str] = None
+    ) -> L2Node:
+        """稀疏均匀 seek l2_representative_frames 帧 → VLM 描述（1-2句）
+        embedding=None"""
 
-    def _build_l1_video(self, l2_children: List[L2Node]) -> L1Node:
-        """Step 4: 同文本模式，聚合 L2 描述 → L1 摘要"""
+    def _build_l3_video(
+        self, frames: List[Tuple[str, float]], l2_description: str, l1_i: int, l2_j: int
+    ) -> List[L3Node]:
+        """注入 L2 上下文的 VLM 批量帧描述
+        - 主路径: 一次 VLM 调用，要求返回 JSON 数组
+        - 降级路径: JSON 解析失败时逐帧调用
+        所有节点 embedding=None"""
+
+    def _build_l3_task(
+        self,
+        video_path: str,
+        l2_node: L2Node,
+        clip_range: Tuple[float, float],
+        source_id: str,
+        l1_i: int,
+        l2_j: int,
+    ) -> L2Node:
+        """L3 线程任务单元：提取帧 + _build_l3_video，返回已填充 children 的 L2Node。
+        由事件循环在 L2 完成后自动提交（非阻塞），线程安全（内部独立持有 VideoCapture）。"""
+
+    def _call_vlm_batch(self, prompt, frame_paths, n, l1_i, l2_j) -> List[str]:
+        """批量 VLM 调用 + JSON 解析失败时降级逐帧"""
+
+    def _parse_json_descriptions(self, raw: str, expected_n: int) -> Optional[List[str]]:
+        """从 VLM 输出解析 JSON 数组，长度不匹配返回 None"""
+
+    def _build_l1_video(
+        self, l2_children: List[L2Node], l1_id: str, l1_range: Tuple[float, float]
+    ) -> L1Node:
+        """拼接 L2 描述 → vlm.chat()（纯文本）生成 2-3 句摘要；embedding=None"""
 ```
+
+**关键配置参数**（`config.tree`）:
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `l1_segment_duration` | 600.0s | L1 切分步长 |
+| `l2_clip_duration` | 60.0s | L2 clip 时长 |
+| `l3_fps` | 1.0 | L3 帧提取速率（帧/秒） |
+| `l2_representative_frames` | 10 | L2 稀疏代表帧数 |
+| `cache_dir` | `cache/trees` | 帧图像持久化目录 |
+| `concurrency` | 16 | 视频内 L2/L3 任务并发数（ThreadPoolExecutor max_workers） |
 
 **依赖**: tree_index, embeddings, llm_client, opencv-python（帧提取）
 
@@ -379,6 +541,7 @@ class VideoTreeBuilder:
 
 **文件**: `video_tree_trm/recursive_retriever.py`
 **职责**: 核心可训练模型。Cross-Attention 节点选择 + MLP 推理 + ACT halt。
+**状态**: ✅ 已实现 | 测试: `tests/unit/test_recursive_retriever.py`（17 个用例全部通过）
 
 #### 1.6.1 CrossAttentionSelector
 
@@ -585,6 +748,7 @@ class RecursiveRetriever(nn.Module):
 
 **文件**: `video_tree_trm/losses.py`
 **职责**: 导航损失（cross-entropy）+ ACT halt 损失（Q-learning）。
+**状态**: ✅ 已实现 | 测试: `tests/unit/test_losses.py`（13 个用例全部通过）
 
 ```python
 class NavigationLoss(nn.Module):
@@ -650,6 +814,7 @@ class ACTLoss(nn.Module):
 
 **文件**: `video_tree_trm/answer_generator.py`
 **职责**: 根据检索结果组装 context，调用 LLM/VLM 生成最终答案。
+**状态**: ✅ 已实现 | 测试: `tests/unit/test_answer_generator.py`（10 个用例全部通过）
 
 ```python
 @dataclass
@@ -695,40 +860,84 @@ class AnswerGenerator:
 
 **文件**: `video_tree_trm/pipeline.py`
 **职责**: 串联 预处理 → 检索 → 生成 的完整推理流程。
+**状态**: ✅ 已实现 | 测试: `tests/unit/test_pipeline.py`（10 个用例全部通过）
 
 ```python
 class Pipeline:
     """端到端推理管线"""
 
     def __init__(self, config: Config):
-        self.embed_model = EmbeddingModel(config.embed.model_name, config.embed.device)
-        self.llm = LLMClient(config.llm.backend, config.llm.api_key, config.llm.model)
-        self.vlm = LLMClient(config.vlm.backend, config.vlm.api_key, config.vlm.model)
+        self.embed_model = EmbeddingModel(config.embed)
+        self.llm = LLMClient(config.llm)
+        self.vlm = LLMClient(config.vlm)
         self.retriever = RecursiveRetriever(config.retriever)
-        self.retriever.load_state_dict(torch.load(config.retriever.checkpoint))
+        # 可选加载检查点（checkpoint=null 时跳过）
+        if config.retriever.checkpoint:
+            state_dict = torch.load(config.retriever.checkpoint, map_location="cpu")
+            self.retriever.load_state_dict(state_dict)
         self.retriever.eval()
         self.generator = AnswerGenerator(self.llm, self.vlm)
 
     def build_index(self, source_path: str, modality: str) -> TreeIndex:
-        """构建并缓存 TreeIndex"""
+        """构建并缓存 TreeIndex（JSON 格式，无 embedding）。
+
+        缓存路径: {cache_dir}/{stem}_{modality}.json
+        - 缓存命中: 直接 load_json 返回（embedding=None）
+        - 缓存未命中: 调用 Builder 生成文字描述，save_json 持久化
+
+        ⚠ 返回的 TreeIndex embedding 全为 None，
+           query() 时会自动调用 _embed_tree() 填充。
+        """
         if modality == "text":
-            builder = TextTreeBuilder(self.embed_model, self.llm, self.config.tree)
-            with open(source_path) as f:
-                return builder.build(f.read(), source_path)
+            builder = TextTreeBuilder(self.llm, self.config.tree)
+            with open(source_path, encoding="utf-8") as f:
+                tree = builder.build(f.read(), source_path)
         else:
-            builder = VideoTreeBuilder(self.embed_model, self.vlm, self.config.tree)
-            return builder.build(source_path)
+            builder = VideoTreeBuilder(self.vlm, self.config.tree)
+            tree = builder.build(source_path)
+        tree.save_json(cache_path)  # JSON 持久化，无 embedding
+        return tree
+
+    def _embed_tree(self, tree: TreeIndex, cache_path: Optional[str] = None) -> None:
+        """对树所有节点执行 embedding（内存中），可选回写缓存。
+        L3 按 L2 分组批量处理，L1/L2 各单独处理。"""
+        tree.embed_all(
+            embed_fn=self.embed_model.embed,
+            model_name=self.config.embed.model_name,
+            embed_dim=self.embed_model.dim,
+        )
+        if cache_path is not None:
+            tree.save_json(cache_path)  # 回写（含 embedding 的 JSON，实际不存储向量）
 
     def query(self, question: str, tree: TreeIndex) -> str:
-        """问答: question → answer"""
-        q = torch.tensor(self.embed_model.embed(question), device=self.config.embed.device)
+        """问答: question → answer。
+
+        若 tree.is_embedded 为 False（JSON 加载后），先触发 _embed_tree()。
+        """
+        # Phase 0: 按需触发 embed_all（JSON 缓存加载后 embedding=None）
+        if not tree.is_embedded:
+            self._embed_tree(tree, cache_path=None)
+
+        # Phase 1: 嵌入查询
+        q = self.embed_model.embed_tensor(question)  # [1, D]
+
+        # Phase 2: 递归检索
         with torch.no_grad():
-            result = self.retriever(q.unsqueeze(0), tree)
-        retrieval_result = RetrievalResult(
-            query=question, paths=result["paths"], num_rounds=result["num_rounds"]
-        )
-        return self.generator.generate(question, retrieval_result, tree)
+            result = self.retriever(q, tree)
+
+        # Phase 3: 生成答案
+        return self.generator.generate(question, result["paths"], tree)
 ```
+
+**与原设计的关键差异**:
+
+| 项目 | 原设计 | 实际实现 |
+|------|--------|---------|
+| Builder 构造器 | `TextTreeBuilder(embed_model, llm, config)` | `TextTreeBuilder(llm, config)` |
+| 缓存格式 | pickle（含 embedding） | JSON（无 embedding），首次 query 时内存 embed |
+| `build_index` 返回 | 含 embedding 的 TreeIndex | `embedding=None` 的 TreeIndex |
+| `query` 额外逻辑 | 直接检索 | 先检查 `is_embedded`，按需调用 `_embed_tree()` |
+| 新增方法 | — | `_embed_tree()` |
 
 **依赖**: 所有其他模块
 
@@ -920,7 +1129,8 @@ VLM_API_KEY=sk-xxx
 
 ## 2. 训练管线
 
-**文件**: `train.py`
+**文件**: `train.py`（项目根目录）
+**状态**: ✅ 已实现 | 测试: `tests/unit/test_train.py`（13 个用例全部通过）
 
 ### 2.1 数据准备
 
@@ -1116,16 +1326,24 @@ Video-Tree-TRM/
 │   ├── __init__.py
 │   └── logger_system.py              # 日志系统 (log_msg, ensure, log_exception)
 ├── config/
-│   └── default.yaml                  # 默认配置
+│   ├── default.yaml                  # 默认配置（通用）
+│   └── videomme.yaml                 # VideoMME 实验专属配置（GPUStack Qwen3-VL）
 ├── tests/
+│   ├── conftest.py                   # 全局 fixture（real_config, 代理修复）
 │   ├── unit/
-│   │   ├── test_tree_index.py
-│   │   ├── test_recursive_retriever.py
-│   │   └── test_losses.py
+│   │   ├── test_config.py            # ✅ 已实现
+│   │   ├── test_embeddings.py        # ✅ 已实现
+│   │   ├── test_llm_client.py        # ✅ 已实现
+│   │   ├── test_tree_index.py        # ✅ 已实现
+│   │   ├── test_text_tree_builder.py # ✅ 已实现（43 用例）
+│   │   ├── test_recursive_retriever.py  # ✅ 已实现（17 用例）
+│   │   ├── test_losses.py               # ✅ 已实现（13 用例）
+│   │   ├── test_answer_generator.py     # ✅ 已实现（10 用例）
+│   │   ├── test_pipeline.py             # ✅ 已实现（10 用例）
+│   │   └── test_train.py                # ✅ 已实现（13 用例）
 │   ├── integration/
-│   │   ├── test_text_tree_builder.py
-│   │   └── test_pipeline.py
 │   └── outputs/                      # Agent 测试 MD 输出
+│       └── text_tree_builder/        # ✅ build_toc_*.md
 ├── data/                             # 数据集（不提交）
 ├── cache/                            # TreeIndex 缓存（不提交）
 ├── checkpoints/                      # 模型权重（不提交）

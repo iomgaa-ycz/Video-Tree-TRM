@@ -23,13 +23,53 @@ from __future__ import annotations
 
 import base64
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Union
 
+import httpx
 import openai
 
 from utils.logger_system import log_exception, log_msg
 from video_tree_trm.config import LLMConfig, VLMConfig
+
+# 502/503 时的重试参数
+_RETRY_STATUS_CODES = {502, 503}
+_MAX_RETRIES = 20          # 最多重试次数（约等待 20+ 分钟）
+_RETRY_BASE_WAIT = 60      # 首次等待 60 秒
+_RETRY_MAX_WAIT = 300      # 单次等待上限 5 分钟
+
+
+def _call_with_retry(fn, label: str):
+    """对 fn() 调用执行指数退避重试（仅重试 502/503）。
+
+    参数:
+        fn: 无参调用的函数，返回 API response。
+        label: 日志标识（如方法名）。
+
+    返回:
+        fn() 的返回值。
+
+    异常:
+        openai.OpenAIError: 超过最大重试次数或非可重试错误时抛出。
+    """
+    wait = _RETRY_BASE_WAIT
+    for attempt in range(1, _MAX_RETRIES + 1):
+        try:
+            return fn()
+        except openai.InternalServerError as exc:
+            status = getattr(exc, "status_code", None)
+            if status not in _RETRY_STATUS_CODES:
+                raise
+            log_msg(
+                "WARNING",
+                f"{label} 遇到 {status}，等待 {wait}s 后重试",
+                attempt=attempt,
+                max_retries=_MAX_RETRIES,
+            )
+            time.sleep(wait)
+            wait = min(wait * 2, _RETRY_MAX_WAIT)
+    raise RuntimeError(f"{label} 已重试 {_MAX_RETRIES} 次仍失败")
 
 
 class LLMClient:
@@ -62,9 +102,11 @@ class LLMClient:
             )
 
         self._config = config
+        # 显式绕过系统代理（http_proxy/https_proxy），直连 GPUStack 内网地址
         self._client = openai.OpenAI(
             api_key=config.api_key,
             base_url=config.api_url,
+            http_client=httpx.Client(proxy=None),
         )
         log_msg(
             "INFO", "LLMClient 初始化完成", model=config.model, api_url=config.api_url
@@ -86,11 +128,14 @@ class LLMClient:
         messages = self._build_messages(prompt)
         tokens = max_tokens if max_tokens is not None else self._config.max_tokens
         try:
-            response = self._client.chat.completions.create(
-                model=self._config.model,
-                messages=messages,
-                max_tokens=tokens,
-                temperature=self._config.temperature,
+            response = _call_with_retry(
+                lambda: self._client.chat.completions.create(
+                    model=self._config.model,
+                    messages=messages,
+                    max_tokens=tokens,
+                    temperature=self._config.temperature,
+                ),
+                label="LLMClient.chat",
             )
             return response.choices[0].message.content
         except Exception as exc:
@@ -121,11 +166,14 @@ class LLMClient:
         messages = self._build_messages(prompt, images=encoded)
         tokens = max_tokens if max_tokens is not None else self._config.max_tokens
         try:
-            response = self._client.chat.completions.create(
-                model=self._config.model,
-                messages=messages,
-                max_tokens=tokens,
-                temperature=self._config.temperature,
+            response = _call_with_retry(
+                lambda: self._client.chat.completions.create(
+                    model=self._config.model,
+                    messages=messages,
+                    max_tokens=tokens,
+                    temperature=self._config.temperature,
+                ),
+                label="LLMClient.chat_with_images",
             )
             return response.choices[0].message.content
         except Exception as exc:

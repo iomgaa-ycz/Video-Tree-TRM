@@ -161,7 +161,7 @@ L1: "厨师在厨房制作意大利面，从准备食材到最终装盘。"
 
 ```
 输入: 长文本文档
-输出: TreeIndex
+输出: TreeIndex（全部 embedding=None）
 
 Pipeline:
   Step 1 — 结构切分
@@ -169,73 +169,94 @@ Pipeline:
      无 ToC → LLM 语义分段 (一次性调用)
 
   Step 2 — L2 先行
-     L2: 段落组 → LLM 生成摘要 (1-2句) → text_embed(摘要)
+     L2: 段落组 → LLM 生成摘要 (1-2句)
          摘要目标: 与兄弟 L2 形成区分
+         （batch_chat 并发生成所有 L2 摘要）
 
   Step 3 — L3 向下
-     L3: 原始段落 → text_embed(段落文本)
-         存储 raw_content = 原始文本
-         （文本模式 L3 不需要 L2 上下文，直接使用原文）
+     L3: 原始段落文本直接复用
+         存储 raw_content = description = 原始文本
+         （文本模式 L3 不需要 L2 上下文，不调用 LLM）
 
   Step 4 — L1 向上聚合
-     L1: LLM("总结这些小节: " + 所有子 L2 摘要) → text_embed(摘要)
+     L1: LLM("总结这些小节: " + 所有子 L2 摘要) → 摘要
          摘要目标: 覆盖下属所有 L2 的语义范围 (2-3句)
 
-  Step 5 — 序列化 → TreeIndex
+  Step 5 — 序列化 → TreeIndex（JSON，无 embedding）
+
+  ⚠ 延迟 Embedding: 所有节点 embedding=None
+     首次检索时由 Pipeline._embed_tree() → tree.embed_all() 统一填充
 ```
 
 ### 4.4 VideoTreeBuilder
 
+**状态**: ✅ 已实现（`video_tree_trm/video_tree_builder.py`）
+
 ```
-输入: 长视频文件
-输出: TreeIndex
+输入: 长视频文件路径 或 YouTube URL
+输出: TreeIndex（全部 embedding=None）
 
-Pipeline:
-  Step 1 — 时间切分
-     场景检测 或 固定步长 → L1/L2 时间边界
-     L1 区间 ⊃ 多个 L2 区间
+Pipeline（ThreadPoolExecutor 异步事件循环）:
+  Step 0 — 输入类型判断
+     本地文件: 直接使用 OpenCV 读取
+     YouTube URL: yt-dlp -g 获取 CDN 直链 + yt-dlp --dump-json 获取时长
 
-  Step 2 — L2 先行（廉价）
-     每个 L2 clip: 采样 2-3 张代表帧 → VLM 生成片段描述 (1-2句)
-     → text_embed(描述)
-     描述目标: 与兄弟 L2 形成区分
+  Step 1 — 时间切分（固定步长）
+     本地: cv2 读取总时长
+     HTTP 流: 使用 yt-dlp 元数据时长（duration_hint，避免 cv2 流上不可靠）
+     固定步长 l1_segment_duration=600s → L1 区间列表
+     每个 L1 区间 → 等分 l2_clip_duration=60s → L2 clips
 
-  Step 3 — L3 向下（贵，批量 + L2 上下文）
-     每个 L2 clip 内的帧: 注入 L2 描述 → VLM 批量帧描述 (1-2句/帧)
-     → text_embed(帧描述)
-     存储 frame_path = 帧图像路径
+  Step 2 — 预计算任务图
+     收集所有 L2 任务 + 记录每个 L1 的 L2 数量（l2_counts）
 
-  Step 4 — L1 向上聚合（廉价）
-     每个 L1: LLM("总结这些片段: " + 所有子 L2 描述) → text_embed(摘要)
-     摘要目标: 覆盖下属所有 L2 的语义范围 (2-3句)
+  Step 3 — 一次性提交所有 L2 任务（非阻塞）
+     ThreadPoolExecutor(max_workers=concurrency)
+     每个 L2 clip: 均匀 seek l2_representative_frames=10 帧 → VLM → 1-2句描述
 
-  Step 5 — 序列化 → TreeIndex
+  Step 4 — 事件循环（cfwait FIRST_COMPLETED）
+     L2 完成 → 立即提交 L3 任务（_build_l3_task，线程安全）
+       L3: 按 l3_fps 提取全量帧（持久化缓存），注入 L2 上下文，VLM 批量帧描述（JSON）
+           降级路径: JSON 解析失败 → 逐帧 VLM 调用
+     L3 完成 → 检查该 L1 的所有 L2 是否就绪 → 触发 L1 任务
+       L1: 拼接所有 L2 描述 → vlm.chat() → 2-3句摘要
+     主线程单线程操作 l1_l2_buckets，无竞争，无需 Lock
+
+  Step 5 — 有序重建 l1_nodes，组装 TreeIndex（写 IndexMeta + 日志）
+
+  ⚠ 延迟 Embedding: 所有节点 embedding=None
+     首次检索时由 Pipeline._embed_tree() → tree.embed_all() 统一填充
 ```
 
-**L3 帧描述的 prompt 设计**（继承 L2 上下文 + 批量处理）：
+**L2 代表帧采样**（均匀 seek，首尾均包含）：
 
 ```python
-# L2 描述已在 Step 2 生成，作为 L3 的上下文注入
-prompt = f"""
-该片段的整体内容: "{l2_description}"
-以下是该片段中连续的 {N} 帧画面。
-对每帧用一到两句话描述其具体画面内容。
-重点关注: 动作、物体变化、文字信息、人物表情。
-不要重复片段整体描述，聚焦每帧的区分性信息。
-"""
-descs = VLM(frames_batch, prompt)  # 一次调用描述 N 帧
+step = (end_sec - start_sec) / (n_rep - 1)
+timestamps = [start_sec + i * step for i in range(n_rep)]
+# → 直接 cap.set(CAP_PROP_POS_MSEC, ts * 1000) 提取，缓存为 l2_{ts:.3f}.jpg
 ```
 
-**L1 摘要的 prompt 设计**（聚合 L2 描述）：
+**L3 帧描述 prompt**（继承 L2 上下文 + 要求 JSON 输出）：
+
+```python
+prompt = (
+    '该片段的整体内容: "{l2_description}"\n'
+    "以下是该片段中连续的 {n} 帧画面。\n"
+    "对每帧用一到两句话描述其具体画面内容。\n"
+    "重点关注: 动作、物体变化、文字信息、人物表情。\n"
+    "不要重复片段整体描述，聚焦每帧的区分性信息。\n"
+    '只返回 JSON 数组，格式: ["帧1描述", "帧2描述", ...]，不要其他内容。'
+)
+descs = VLM(frames_batch, prompt)  # 主路径：一次调用，JSON 解析
+# 降级：json.loads 失败 → 逐帧调用
+```
+
+**L1 摘要 prompt**：
 
 ```python
 l2_texts = "\n".join(f"- {node.description}" for node in l2_children)
-prompt = f"""
-以下是一个视频段落中各片段的描述:
-{l2_texts}
-用2-3句话总结该段落的整体内容，涵盖所有片段的主题。
-"""
-l1_summary = LLM(prompt)
+prompt = f"以下是一个视频段落中各片段的描述:\n{l2_texts}\n用2-3句话总结该段落的整体内容，涵盖所有片段的主题。"
+l1_summary = vlm.chat(prompt)  # 纯文本调用
 ```
 
 ---
@@ -293,7 +314,8 @@ L_level 推理模块使用 **MLP-based**（RMSNorm + SwiGLU），操作对象为
 │  │                                                           │
 │  │  ┌─── ACT Halt Decision ───────────────────┐             │
 │  │  │ halt_logit = q_head(z)                   │             │
-│  │  │ if halt_logit > 0: break                 │             │
+│  │  │ if halt_logit > 0 and round_idx > 0:     │             │
+│  │  │     break  # 至少跑 1 轮                  │             │
 │  │  └──────────────────────────────────────────┘             │
 │  │                                                           │
 │  └── z 状态保留到下一轮（累积已检索信息）                     │
@@ -315,21 +337,23 @@ class RecursiveRetriever:
         self.L_cycles = L_cycles
         self.max_rounds = max_rounds
 
-    def retrieve(self, q: Tensor, tree: TreeIndex) -> List[Path]:
-        z = q.clone()                   # [B, D]
-        collected = []
+    def forward(
+        self, q: Tensor, tree: TreeIndex, return_internals: bool = False
+    ) -> Dict[str, Any]:
+        z = q.clone()                   # [B, D]，初始潜在状态 = 查询嵌入
+        paths = []
 
         for round_idx in range(self.max_rounds):
             # ── 三阶段树遍历（一次完整 root-to-leaf） ──
-            path, z = self._traverse_one_path(q, z, tree)
-            collected.append(path)
+            path, z, step_attns = self._traverse_one_path(q, z, tree)
+            paths.append(path)
 
-            # ── ACT halt ──
-            halt_logit = self.q_head(z)
-            if halt_logit > 0 and round_idx > 0:  # 至少走一轮
+            # ── ACT halt（推理模式，至少走 1 轮） ──
+            halt_logit = self.q_head(z)  # [B, 1]
+            if not self.training and halt_logit.item() > 0 and round_idx > 0:
                 break
 
-        return collected
+        return {"paths": paths, "num_rounds": len(paths), "z_final": z}
 
     def _traverse_one_path(self, q, z, tree):
         """单次 root → L1 → L2 → L3 遍历。"""
@@ -516,18 +540,18 @@ video_tree_trm.py (cosine路由)    → RecursiveRetriever      Cross-Attention+
   L_level (Transformer blocks)    → ReasoningModule          MLP-based (向量非序列)
 visual_projection.py              → 删除                    L3 全文本化
 video_indexer.py (CLIP encode)    → embeddings.py            统一 text_embed()
-pipeline.py                       → pipeline.py             适配新接口
-answer_generator.py               → answer_generator.py     不变
+pipeline.py                       → pipeline.py             ✅ 已实现（含延迟 embed 策略）
+answer_generator.py               → answer_generator.py     ✅ 已实现
 config.py                         → config.py               全面重构
 
 新增:
-  + tree_index.py                 统一数据结构
-  + embeddings.py                 嵌入服务封装
-  + llm_client.py                 LLM/VLM 客户端
-  + text_tree_builder.py          文本模式预处理
-  + video_tree_builder.py         视频模式预处理
-  + recursive_retriever.py        TRM 递归检索器 (CA + MLP + ACT)
-  + losses.py                     NavigationLoss + ACTLoss
-  + train.py                      两阶段训练入口
-  + main.py                       推理/演示入口
+  + tree_index.py                 统一数据结构              ✅ 已实现
+  + embeddings.py                 嵌入服务封装              ✅ 已实现
+  + llm_client.py                 LLM/VLM 客户端            ✅ 已实现
+  + text_tree_builder.py          文本模式预处理            ✅ 已实现
+  + video_tree_builder.py         视频模式预处理            ✅ 已实现
+  + recursive_retriever.py        TRM 递归检索器 (CA+MLP+ACT) ✅ 已实现
+  + losses.py                     NavigationLoss + ACTLoss  ✅ 已实现
+  + train.py                      两阶段训练入口            ✅ 已实现
+  + main.py                       推理/演示入口             ✅ 已实现
 ```
