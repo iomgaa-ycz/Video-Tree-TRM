@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import pickle
 from dataclasses import dataclass, field
@@ -28,6 +29,39 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import numpy as np
 
 from utils.logger_system import ensure, log_msg
+
+
+# ---------------------------------------------------------------------------
+# Embedding 序列化辅助函数
+# ---------------------------------------------------------------------------
+
+
+def _embed_to_str(arr: Optional[np.ndarray]) -> Optional[str]:
+    """float32 ndarray → base64 字符串（用于 JSON 序列化）。
+
+    参数:
+        arr: float32 数组，形状任意。
+
+    返回:
+        base64 编码字符串，或 None（输入为 None 时）。
+    """
+    if arr is None:
+        return None
+    return base64.b64encode(arr.astype(np.float32).tobytes()).decode()
+
+
+def _embed_from_str(s: Optional[str]) -> Optional[np.ndarray]:
+    """base64 字符串 → float32 ndarray（用于 JSON 反序列化）。
+
+    参数:
+        s: base64 编码字符串。
+
+    返回:
+        float32 数组，或 None（输入为 None/空时）。
+    """
+    if s is None or s == "":
+        return None
+    return np.frombuffer(base64.b64decode(s), dtype=np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +156,96 @@ class L1Node:
     embedding: Optional[np.ndarray] = None  # [D]，build 时为 None，embed_all 后填充
     time_range: Optional[Tuple[float, float]] = None
     children: List[L2Node] = field(default_factory=list)
+
+    # ------------------------------------------------------------------
+    # JSON 辅助方法（单个 L1 段的轻量序列化）
+    # ------------------------------------------------------------------
+
+    def to_dict(self, include_embedding: bool = False) -> Dict[str, Any]:
+        """将当前 L1 节点（及其全部 L2/L3 子树）序列化为纯 dict。
+
+        参数:
+            include_embedding: 若 True，将 embedding 向量序列化为 base64 字符串。
+
+        返回:
+            包含 id/summary/time_range/children 的字典，可选包含 embedding。
+        """
+
+        def l3_to_dict(n: L3Node) -> Dict[str, Any]:
+            d = {
+                "id": n.id,
+                "description": n.description,
+                "timestamp": n.timestamp,
+                "frame_path": n.frame_path,
+                "raw_content": n.raw_content,
+            }
+            if include_embedding:
+                d["embedding"] = _embed_to_str(n.embedding)
+            return d
+
+        def l2_to_dict(n: L2Node) -> Dict[str, Any]:
+            d = {
+                "id": n.id,
+                "description": n.description,
+                "time_range": list(n.time_range) if n.time_range else None,
+                "children": [l3_to_dict(c) for c in n.children],
+            }
+            if include_embedding:
+                d["embedding"] = _embed_to_str(n.embedding)
+            return d
+
+        d = {
+            "id": self.id,
+            "summary": self.summary,
+            "time_range": list(self.time_range) if self.time_range else None,
+            "children": [l2_to_dict(c) for c in self.children],
+        }
+        if include_embedding:
+            d["embedding"] = _embed_to_str(self.embedding)
+        return d
+
+    @staticmethod
+    def from_dict(d: Dict[str, Any]) -> "L1Node":
+        """从 dict 反序列化单个 L1 节点（支持 embedding 恢复）。
+
+        参数:
+            d: to_dict() 输出的字典，可包含 embedding 字段。
+
+        返回:
+            L1Node 实例（embedding 自动从 base64 恢复，若无则为 None）。
+        """
+        l2_nodes: List[L2Node] = []
+        for l2d in d.get("children", []):
+            l3_nodes: List[L3Node] = []
+            for l3d in l2d.get("children", []):
+                l3_nodes.append(
+                    L3Node(
+                        id=l3d["id"],
+                        description=l3d["description"],
+                        embedding=_embed_from_str(l3d.get("embedding")),
+                        timestamp=l3d.get("timestamp"),
+                        frame_path=l3d.get("frame_path"),
+                        raw_content=l3d.get("raw_content"),
+                    )
+                )
+            tr2 = l2d.get("time_range")
+            l2_nodes.append(
+                L2Node(
+                    id=l2d["id"],
+                    description=l2d["description"],
+                    embedding=_embed_from_str(l2d.get("embedding")),
+                    time_range=tuple(tr2) if tr2 else None,
+                    children=l3_nodes,
+                )
+            )
+        tr1 = d.get("time_range")
+        return L1Node(
+            id=d["id"],
+            summary=d["summary"],
+            embedding=_embed_from_str(d.get("embedding")),
+            time_range=tuple(tr1) if tr1 else None,
+            children=l2_nodes,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -315,60 +439,69 @@ class TreeIndex:
     # JSON 序列化（主格式，无 embedding）
     # ------------------------------------------------------------------ #
 
-    def to_dict(self) -> Dict[str, Any]:
-        """将树索引序列化为纯 Python dict（不含 embedding 向量）。
+    def to_dict(self, include_embedding: bool = False) -> Dict[str, Any]:
+        """将树索引序列化为纯 Python dict。
+
+        参数:
+            include_embedding: 若 True，将所有节点的 embedding 向量序列化为 base64。
 
         返回:
-            可直接 json.dump 的字典，结构为 {metadata, roots[{id, summary,
-            time_range, children[{id, description, time_range, children[...]}]}]}。
+            可直接 json.dump 的字典，结构为 {metadata, roots[...]}。
+            当 include_embedding=True 时，每个节点包含 embedding 字段。
         """
+
         def l3_to_dict(n: L3Node) -> Dict[str, Any]:
-            return {
+            d = {
                 "id": n.id,
                 "description": n.description,
                 "timestamp": n.timestamp,
                 "frame_path": n.frame_path,
                 "raw_content": n.raw_content,
             }
+            if include_embedding:
+                d["embedding"] = _embed_to_str(n.embedding)
+            return d
 
         def l2_to_dict(n: L2Node) -> Dict[str, Any]:
-            return {
+            d = {
                 "id": n.id,
                 "description": n.description,
                 "time_range": list(n.time_range) if n.time_range else None,
                 "children": [l3_to_dict(c) for c in n.children],
             }
+            if include_embedding:
+                d["embedding"] = _embed_to_str(n.embedding)
+            return d
 
-        def l1_to_dict(n: L1Node) -> Dict[str, Any]:
-            return {
-                "id": n.id,
-                "summary": n.summary,
-                "time_range": list(n.time_range) if n.time_range else None,
-                "children": [l2_to_dict(c) for c in n.children],
-            }
+        metadata_dict = {
+            "source_path": self.metadata.source_path,
+            "modality": self.metadata.modality,
+            "created_at": self.metadata.created_at,
+        }
+        if include_embedding:
+            metadata_dict["embed_model"] = self.metadata.embed_model
+            metadata_dict["embed_dim"] = self.metadata.embed_dim
 
         return {
-            "metadata": {
-                "source_path": self.metadata.source_path,
-                "modality": self.metadata.modality,
-                "created_at": self.metadata.created_at,
-            },
-            "roots": [l1_to_dict(r) for r in self.roots],
+            "metadata": metadata_dict,
+            "roots": [r.to_dict(include_embedding=include_embedding) for r in self.roots],
         }
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "TreeIndex":
-        """从 dict 反序列化为 TreeIndex（embedding 字段全为 None）。
+        """从 dict 反序列化为 TreeIndex（支持 embedding 恢复）。
 
         参数:
-            d: to_dict() 的输出或等价结构。
+            d: to_dict() 的输出或等价结构，可包含 embedding 字段。
 
         返回:
-            TreeIndex 实例（所有节点 embedding=None）。
+            TreeIndex 实例（若 JSON 中有 embedding 字段，自动反序列化填充）。
         """
         meta = IndexMeta(
             source_path=d["metadata"]["source_path"],
             modality=d["metadata"]["modality"],
+            embed_model=d["metadata"].get("embed_model"),
+            embed_dim=d["metadata"].get("embed_dim"),
             created_at=d["metadata"].get("created_at", datetime.now().isoformat()),
         )
 
@@ -381,6 +514,7 @@ class TreeIndex:
                     l3_nodes.append(L3Node(
                         id=l3d["id"],
                         description=l3d["description"],
+                        embedding=_embed_from_str(l3d.get("embedding")),
                         timestamp=l3d.get("timestamp"),
                         frame_path=l3d.get("frame_path"),
                         raw_content=l3d.get("raw_content"),
@@ -389,6 +523,7 @@ class TreeIndex:
                 l2_nodes.append(L2Node(
                     id=l2d["id"],
                     description=l2d["description"],
+                    embedding=_embed_from_str(l2d.get("embedding")),
                     time_range=tuple(tr2) if tr2 else None,
                     children=l3_nodes,
                 ))
@@ -396,31 +531,39 @@ class TreeIndex:
             roots.append(L1Node(
                 id=r["id"],
                 summary=r["summary"],
+                embedding=_embed_from_str(r.get("embedding")),
                 time_range=tuple(tr1) if tr1 else None,
                 children=l2_nodes,
             ))
 
         return cls(metadata=meta, roots=roots)
 
-    def save_json(self, path: str) -> None:
-        """将树索引以 JSON 格式保存到磁盘（不含 embedding）。
+    def save_json(self, path: str, include_embedding: bool = False) -> None:
+        """将树索引以 JSON 格式保存到磁盘。
 
         参数:
             path: 保存文件路径（推荐 .json 后缀）。
+            include_embedding: 若 True，将所有节点的 embedding 向量保存到 JSON。
         """
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.to_dict(), f, ensure_ascii=False, indent=2)
-        log_msg("INFO", f"树索引（JSON）已保存至 {path}", n_l1=len(self.roots))
+            json.dump(self.to_dict(include_embedding=include_embedding), f, ensure_ascii=False, indent=2)
+        log_msg(
+            "INFO",
+            f"树索引（JSON）已保存至 {path}",
+            n_l1=len(self.roots),
+            include_embedding=include_embedding,
+        )
 
     @classmethod
     def load_json(cls, path: str) -> "TreeIndex":
-        """从 JSON 文件加载树索引（embedding=None）。
+        """从 JSON 文件加载树索引（自动检测并恢复 embedding）。
 
         参数:
             path: JSON 文件路径。
 
         返回:
-            TreeIndex 实例。
+            TreeIndex 实例。若 JSON 中包含 embedding 字段，自动反序列化填充；
+            否则 embedding=None（向后兼容旧格式）。
 
         异常:
             FileNotFoundError: 文件不存在。
@@ -428,8 +571,34 @@ class TreeIndex:
         with open(path, "r", encoding="utf-8") as f:
             d = json.load(f)
         obj = cls.from_dict(d)
-        log_msg("INFO", f"树索引（JSON）已从 {path} 加载", n_l1=len(obj.roots))
+        log_msg(
+            "INFO",
+            f"树索引（JSON）已从 {path} 加载",
+            n_l1=len(obj.roots),
+            is_embedded=obj.is_embedded,
+        )
         return obj
+
+
+def save_l1_json(path: str, l1_node: L1Node) -> None:
+    """将单个 L1 节点（及其子树）以 JSON 形式保存到磁盘。
+
+    参数:
+        path: 目标文件路径。
+        l1_node: 待序列化的 L1 节点。
+    """
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(l1_node.to_dict(), f, ensure_ascii=False, indent=2)
+    log_msg("INFO", "L1 中间结果已保存", path=path, l1_id=l1_node.id)
+
+
+def load_l1_json(path: str) -> L1Node:
+    """从 JSON 文件加载单个 L1 节点（embedding=None）。"""
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    node = L1Node.from_dict(data)
+    log_msg("INFO", "L1 中间结果已加载", path=path, l1_id=node.id)
+    return node
 
     # ------------------------------------------------------------------ #
     # 序列化（pickle，保留供向后兼容）

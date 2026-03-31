@@ -48,13 +48,13 @@ with open('${JSONL}') as f:
 TOTAL=$(wc -l < "${TMP_IDS}")
 echo "[$(date)] 总计: ${TOTAL} 个视频，并发数: ${CONCURRENT}" | tee -a "${LOG}"
 
-# 并发下载：每个 youtube_id 单独调用 yt-dlp
+# 3 2.5Mb/s并发下载：每个 youtube_id 单独调用 yt-dlp
 # 注意：直接在 xargs 中内联参数，不依赖 bash 数组导出
-xargs -P "${CONCURRENT}" -I YID bash -c '
+xargs -P "${CONCURRENT}" -I {} bash -c '
     VIDEO_DIR="'"${VIDEO_DIR}"'"
     LOG="'"${LOG}"'"
     FAILED_FILE="'"${FAILED_FILE}"'"
-    YID="YID"
+    YID="{}"
     OUT="${VIDEO_DIR}/${YID}.mp4"
 
     if [[ -f "${OUT}" && -s "${OUT}" ]]; then
@@ -65,8 +65,8 @@ xargs -P "${CONCURRENT}" -I YID bash -c '
     URL="https://www.youtube.com/watch?v=${YID}"
     echo "[$(date)] [START] ${YID}" >> "${LOG}"
 
-    if trickle -d 785 yt-dlp \
-        --format "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best" \
+    if yt-dlp \
+        --format "bestvideo[vcodec^=avc][ext=mp4]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best" \
         --merge-output-format mp4 \
         --output "${OUT}" \
         --no-playlist \
@@ -74,6 +74,7 @@ xargs -P "${CONCURRENT}" -I YID bash -c '
         --fragment-retries 5 \
         --socket-timeout 60 \
         --no-warnings \
+        --rate-limit 833K \
         "${URL}" >> "${LOG}" 2>&1; then
         echo "[$(date)] [OK]   ${YID}  size=$(du -sh "${OUT}" 2>/dev/null | cut -f1)" >> "${LOG}"
     else
