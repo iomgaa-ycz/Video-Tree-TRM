@@ -73,6 +73,8 @@ class NavigationLoss(nn.Module):
             - NLL loss = -log(attn_w[gt_idx])，与 cross-entropy 等价
               （因为 attn_w 已经过 softmax 归一化）。
             - target 需 expand 到 batch size B 以兼容任意批大小。
+            - 当 gt_idx 超出 attn_w 的候选范围（retriever 选错父节点），
+              对该层施加最大惩罚 loss（-log(1e-8)），推动模型学会选对路径。
         """
         ensure(
             len(attn_weights_list) == 3,
@@ -80,15 +82,24 @@ class NavigationLoss(nn.Module):
         )
 
         total_loss = torch.tensor(0.0, device=attn_weights_list[0].device)
+        valid_layers = 0
 
         for attn_w, gt_idx in zip(attn_weights_list, gt_path):
-            # attn_w: [B, N]
             B = attn_w.shape[0]
-            log_probs = attn_w.clamp(min=1e-8).log()  # [B, N]，防止数值下溢
-            target = torch.tensor([gt_idx], device=attn_w.device).expand(B)  # [B]
-            total_loss = total_loss + F.nll_loss(log_probs, target)
+            N = attn_w.shape[1]
 
-        return total_loss / 3  # 三层平均
+            if gt_idx >= N:
+                # retriever 选错父节点，GT 索引超出当前候选范围
+                # 施加最大惩罚：-log(min_prob) 推动模型学会选对路径
+                penalty = -torch.log(attn_w.clamp(min=1e-8).min()).mean()
+                total_loss = total_loss + penalty
+            else:
+                log_probs = attn_w.clamp(min=1e-8).log()  # [B, N]
+                target = torch.tensor([gt_idx], device=attn_w.device).expand(B)  # [B]
+                total_loss = total_loss + F.nll_loss(log_probs, target)
+            valid_layers += 1
+
+        return total_loss / max(valid_layers, 1)  # 层数平均
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +243,12 @@ def compute_nav_act_loss(
     halt_logits: List[Tensor] = result["halt_logits"]
 
     l_nav = nav_loss_fn(attn_w_first_round, gt_path)
-    l_act = act_loss_fn(halt_logits, answer_qualities)
+
+    if act_weight > 0 and answer_qualities:
+        l_act = act_loss_fn(halt_logits, answer_qualities)
+    else:
+        l_act = torch.tensor(0.0, device=l_nav.device)
+
     l_total = nav_weight * l_nav + act_weight * l_act
 
     log_msg(

@@ -136,6 +136,11 @@ class RetrieverConfig:
     max_rounds: int
     ffn_expansion: float
     checkpoint: Optional[str]
+    # 多路径检索配置 (Top-k)
+    k_l1: int = 1
+    k_l2: int = 1
+    k_l3: int = 1
+    max_paths: int = 5
 
 
 @dataclass

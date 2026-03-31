@@ -84,90 +84,92 @@ class AnswerGenerator:
     def generate(
         self,
         query: str,
-        paths: List[Tuple[int, int, int]],
+        paths: List[RetrievalPath],
         tree: TreeIndex,
+        frame_hits: Optional[List[FrameHit]] = None,
     ) -> str:
         """根据检索路径生成最终答案。
 
         参数:
             query: 用户查询字符串。
-            paths: 多轮检索路径列表，每项为 (k1, k2, k3) 整数三元组，
-                   直接对应 RecursiveRetriever.forward()["paths"] 的输出。
-            tree:  预构建的 TreeIndex，通过 get_node() 按路径访问 L3 节点。
+            paths: 多轮检索路径列表 (RetrievalPath 对象)。
+            tree:  预构建的 TreeIndex。
+            frame_hits: 可选的关键帧命中列表 (FrameHit 对象)，若提供则优先使用。
 
         返回:
             生成的答案字符串。
-
-        实现细节:
-            - 通过 tree.metadata.modality 判断模态（"text" / "video"）。
-            - 文本模式: 跳过 raw_content 为 None 的节点。
-            - 视频模式: 若所有节点均无 frame_path，退化为 LLM 纯文本调用。
-            - 视频模式使用 VLM 时须已提供 vlm 客户端。
         """
-        ensure(len(paths) > 0, "paths 不能为空，至少需要一条检索路径")
-
-        # 按路径提取 L3 节点
-        nodes = [tree.get_node(k1, k2, k3) for k1, k2, k3 in paths]
-
         modality = tree.metadata.modality
         log_msg(
             "INFO",
             "开始答案生成",
             modality=modality,
             num_paths=len(paths),
+            num_frame_hits=len(frame_hits) if frame_hits else 0,
             query=query[:50],
         )
 
         if modality == "text":
-            return self._generate_text(query, nodes)
+            return self._generate_text(query, paths)
         else:
-            return self._generate_video(query, nodes)
+            return self._generate_video(query, paths, frame_hits)
 
-    # ── 私有方法 ──────────────────────────────────────────────────────────────
+    def _generate_text(self, query: str, paths: List[RetrievalPath]) -> str:
+        """文本模式答案生成。"""
+        # 提取 raw_content 并去重
+        contents = []
+        seen = set()
+        for p in paths:
+            if p.raw_content and p.raw_content not in seen:
+                contents.append(p.raw_content)
+                seen.add(p.raw_content)
 
-    def _generate_text(self, query: str, nodes: list) -> str:
-        """文本模式答案生成。
-
-        参数:
-            query: 用户查询。
-            nodes: L3Node 列表。
-
-        返回:
-            LLM 生成的答案字符串。
-        """
-        context = "\n---\n".join(n.raw_content for n in nodes if n.raw_content)
+        context = "\n---\n".join(contents)
         if not context:
             context = "（无可用上下文）"
         prompt = _TEXT_PROMPT.format(context=context, query=query)
         return self._llm.chat(prompt)
 
-    def _generate_video(self, query: str, nodes: list) -> str:
-        """视频模式答案生成。
+    def _generate_video(
+        self,
+        query: str,
+        paths: List[RetrievalPath],
+        frame_hits: Optional[List[FrameHit]] = None,
+    ) -> str:
+        """视频模式答案生成。"""
+        frames = []
+        captions = []
+        seen_frames = set()
 
-        参数:
-            query: 用户查询。
-            nodes: L3Node 列表（含 frame_path / description）。
+        if frame_hits:
+            # 优先使用精确定位的 frame_hits
+            for hit in frame_hits:
+                if hit.frame_path not in seen_frames:
+                    frames.append(hit.frame_path)
+                    seen_frames.add(hit.frame_path)
+                    # 尝试从 tree 找到对应的描述
+                    # 这里简化处理：暂时不重复找描述，或者从 paths 里匹配
+        
+        # 补充 paths 里的信息（如果 frame_hits 不够或者未提供）
+        for p in paths:
+            if p.frame_path and p.frame_path not in seen_frames:
+                frames.append(p.frame_path)
+                seen_frames.add(p.frame_path)
+            if p.l3_description:
+                captions.append(p.l3_description)
 
-        返回:
-            VLM/LLM 生成的答案字符串。
-
-        实现细节:
-            - 若存在有效帧路径：调用 VLM（多模态），需要 vlm 客户端。
-            - 若所有帧路径为空：退化为 LLM 纯文本（用 description 作为上下文）。
-        """
-        frames = [n.frame_path for n in nodes if n.frame_path]
-        captions = [n.description for n in nodes]
-        caption_text = "\n".join(f"- {c}" for c in captions if c)
+        # 限制帧数，避免 VLM token 溢出
+        frames = frames[:10]
+        caption_text = "\n".join(f"- {c}" for c in captions[:10] if c)
 
         if frames:
             ensure(
                 self._vlm is not None,
-                "视频模式需要 VLM 客户端，请在 AnswerGenerator.__init__() 中传入 vlm 参数",
+                "视频模式需要 VLM 客户端",
             )
             prompt = _VIDEO_PROMPT.format(captions=caption_text, query=query)
-            return self._vlm.chat_with_images(prompt, images=frames)  # type: ignore[union-attr]
+            return self._vlm.chat_with_images(prompt, images=frames)
         else:
-            # 无帧路径：退化为 LLM 纯文本
             log_msg("INFO", "视频模式无可用帧，退化为 LLM 纯文本生成")
             prompt = _VIDEO_FALLBACK_PROMPT.format(captions=caption_text, query=query)
             return self._llm.chat(prompt)

@@ -234,23 +234,20 @@ class CrossAttentionSelector(nn.Module):
         self.W_o = nn.Linear(embed_dim, embed_dim)
 
     def forward(
-        self, state: Tensor, candidates: Tensor
-    ) -> Tuple[Tensor, Tensor, Tensor]:
+        self, state: Tensor, candidates: Tensor, k: int = 1
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """多头 Cross-Attention 节点选择。
 
         参数:
             state:      当前 q+z 融合状态，形状 [B, D]。
             candidates: 该层候选节点嵌入，形状 [B, N, D]。
+            k:          返回 Top-k 个候选。
 
         返回:
-            selected_info: Attention 加权节点信息（可微），形状 [B, D]。
-            attn_weights:  归一化注意力权重（用于 nav loss），形状 [B, N]。
-            selected_idx:  argmax 节点索引（用于路径记录），形状 [B]。
-
-        实现细节:
-            - Q 来自 state（查询），K/V 来自 candidates（候选节点）
-            - 注意力权重取各头平均后 softmax，用于 NavigationLoss
-            - selected_idx 为 argmax，不参与梯度传播
+            selected_info: Attention 加权节点信息（软选择，用于状态更新），形状 [B, D]。
+            attn_weights:  所有候选节点的归一化权重（用于 loss），形状 [B, N]。
+            topk_indices:  得分最高的 k 个节点索引，形状 [B, k]。
+            topk_scores:   得分最高的 k 个节点分数，形状 [B, k]。
         """
         B, N, D = candidates.shape
 
@@ -270,12 +267,28 @@ class CrossAttentionSelector(nn.Module):
         attn_out = attn_out.transpose(1, 2).reshape(B, 1, D)
         selected_info = self.W_o(attn_out).squeeze(1)  # [B, D]
 
-        # Phase 4: 注意力权重（各头平均，用于 loss 和可解释性）
+        # Phase 4: 注意力权重（各头平均）
         raw_scores = (Q @ K.transpose(-2, -1)) * self.scale  # [B, H, 1, N]
         attn_weights = raw_scores.mean(dim=1).squeeze(1).softmax(dim=-1)  # [B, N]
-        selected_idx = attn_weights.argmax(dim=-1)  # [B]
 
-        return selected_info, attn_weights, selected_idx
+        # Phase 5: Top-k 选取
+        k = min(k, N)
+        topk_scores, topk_indices = torch.topk(attn_weights, k, dim=-1)
+
+        return selected_info, attn_weights, topk_indices, topk_scores
+
+    def score_frames(self, query_state: Tensor, frame_embs: Tensor) -> Tensor:
+        """对叶子层（L3）帧进行打分。
+
+        参数:
+            query_state: 当前融合状态 [B, D]。
+            frame_embs:  帧嵌入 [B, M, D]。
+
+        返回:
+            scores: 每帧的得分 [B, M]。
+        """
+        _, attn_weights, _, _ = self.forward(query_state, frame_embs, k=1)
+        return attn_weights
 
 
 # ---------------------------------------------------------------------------
@@ -284,47 +297,60 @@ class CrossAttentionSelector(nn.Module):
 
 
 @dataclass
+class FrameHit:
+    """关键帧命中信息。
+
+    属性:
+        timestamp:  帧时间戳（秒）。
+        score:      该帧的检索得分（Cross-Attention 权重）。
+        frame_path: 帧图像文件路径。
+        l3_id:      所属 L3 节点 ID。
+        l2_id:      所属 L2 节点 ID。
+        l1_id:      所属 L1 节点 ID。
+    """
+
+    timestamp: float
+    score: float
+    frame_path: str
+    l3_id: str
+    l2_id: str
+    l1_id: str
+
+
+@dataclass
 class RetrievalPath:
     """单条 root-to-leaf 检索路径及其内容。
 
     属性:
-        k1: L1 节点索引。
-        k2: L2 节点索引（相对于 k1 下的子节点）。
-        k3: L3 节点索引（相对于 k2 下的子节点）。
-        l1_summary: L1 节点摘要文本。
-        l2_description: L2 节点描述文本。
-        l3_description: L3 节点描述文本。
-        raw_content: 原始文本内容（文本模式），视频模式为 None。
-        frame_path: 帧图像路径（视频模式），文本模式为 None。
-        timestamp: 帧时间戳秒数（视频模式），文本模式为 None。
+        k1, k2, k3: 层级索引。
+        score:      路径综合得分。
+        l1_summary, l2_description, l3_description: 文本描述。
+        raw_content: 文本内容（文本模态）。
+        frame_path:  帧路径（视频模态）。
+        timestamp:   帧时间戳（视频模态）。
     """
 
     k1: int
     k2: int
     k3: int
+    score: float
     l1_summary: str
     l2_description: str
     l3_description: str
-    raw_content: Optional[str]
-    frame_path: Optional[str]
-    timestamp: Optional[float]
+    raw_content: Optional[str] = None
+    frame_path: Optional[str] = None
+    timestamp: Optional[float] = None
 
 
 @dataclass
 class RetrievalResult:
-    """检索器完整输出。
-
-    属性:
-        query: 原始查询字符串。
-        paths: 多轮检索收集的 RetrievalPath 列表。
-        num_rounds: 实际检索轮次（≤ max_rounds）。
-        z_final: 最终潜在状态，形状 [D]，float32 numpy 数组。
-    """
+    """检索器完整输出。"""
 
     query: str
     paths: List[RetrievalPath]
+    frame_hits: List[FrameHit]
     num_rounds: int
-    z_final: np.ndarray  # [D] float32
+    z_final: Tensor  # [B, D]
 
 
 # ---------------------------------------------------------------------------
@@ -348,17 +374,9 @@ class RecursiveRetriever(nn.Module):
     """
 
     def __init__(self, config: RetrieverConfig) -> None:
-        """初始化 RecursiveRetriever。
-
-        参数:
-            config: RetrieverConfig，包含 embed_dim/num_heads/L_layers/
-                    L_cycles/max_rounds/ffn_expansion 等参数。
-
-        实现细节:
-            q_head.bias 初始化为 -5.0，使 sigmoid ≈ 0（倾向"继续"），
-            避免模型在训练初期过早停止。
-        """
+        """初始化 RecursiveRetriever。"""
         super().__init__()
+        self.config = config
         self.selector = CrossAttentionSelector(config.embed_dim, config.num_heads)
         self.L_level = ReasoningModule(
             config.embed_dim, config.L_layers, config.ffn_expansion
@@ -366,6 +384,9 @@ class RecursiveRetriever(nn.Module):
         self.q_head = nn.Linear(config.embed_dim, 1)
         self.L_cycles = config.L_cycles
         self.max_rounds = config.max_rounds
+
+        # 阈值判定：如果最大分数低于此值，视为“未找到”
+        self.low_conf_threshold = 0.1
 
         # 初始化 q_head bias 为 -5（sigmoid(-5) ≈ 0.007，倾向继续）
         with torch.no_grad():
@@ -376,9 +397,10 @@ class RecursiveRetriever(nn.Module):
             "RecursiveRetriever 初始化完成",
             embed_dim=config.embed_dim,
             num_heads=config.num_heads,
-            L_layers=config.L_layers,
-            L_cycles=config.L_cycles,
-            max_rounds=config.max_rounds,
+            k_l1=config.k_l1,
+            k_l2=config.k_l2,
+            k_l3=config.k_l3,
+            max_paths=config.max_paths,
         )
 
     def forward(
@@ -387,57 +409,45 @@ class RecursiveRetriever(nn.Module):
         tree: TreeIndex,
         return_internals: bool = False,
     ) -> Dict[str, Any]:
-        """训练/推理统一入口。
-
-        参数:
-            q: 查询嵌入，形状 [B, D]，来自冻结的 text_embed。
-            tree: 预构建的 TreeIndex。
-            return_internals: 为 True 时返回中间状态（供 loss 计算）。
-
-        返回:
-            字典，始终包含:
-                "paths":      List[Tuple[int, int, int]]，每轮的 (k1, k2, k3)。
-                "num_rounds": int，实际检索轮次。
-                "z_final":    Tensor [B, D]，最终潜在状态。
-            return_internals=True 时额外包含:
-                "attn_weights_per_step": List[Tensor]，每步 [B, N]（共 num_rounds×3 项）。
-                "halt_logits":           List[Tensor]，每轮 [B, 1]。
-
-        实现细节:
-            - 训练模式: 固定跑 max_rounds 轮，不提前停止。
-            - 推理模式: halt_logit > 0 且 round_idx > 0 时提前停止。
-            - z 状态在轮间保留，累积已检索信息。
-        """
+        """多轮多路径检索。"""
         ensure(q.dim() == 2, f"q 应为 [B, D] 张量，实际 shape={q.shape}")
 
-        z = q.clone()  # [B, D]，初始潜在状态 = 查询嵌入
-        paths: List[Tuple[int, int, int]] = []
+        z = q.clone()  # [B, D]
+        all_paths: List[RetrievalPath] = []
+        all_frame_hits: List[FrameHit] = []
         attn_weights_all: List[Tensor] = []
         halt_logits_all: List[Tensor] = []
 
         for round_idx in range(self.max_rounds):
-            # 单次完整 L1 → L2 → L3 遍历
-            path, z, step_attns = self._traverse_one_path(q, z, tree)
-            paths.append(path)
-            attn_weights_all.extend(step_attns)  # 每轮追加 3 步的 attn_weights
+            # 执行多路径遍历
+            round_paths, round_frame_hits, z, step_attns = self._traverse_multi_path(q, z, tree)
+            
+            all_paths.extend(round_paths)
+            all_frame_hits.extend(round_frame_hits)
+            attn_weights_all.extend(step_attns)
 
             # ACT halt 决策
-            halt_logit = self.q_head(z)  # [B, 1]
+            halt_logit = self.q_head(z)
             halt_logits_all.append(halt_logit)
 
-            # 推理模式下：至少走 1 轮，halt_logit > 0 时停止
+            # 推理模式下：至少走 1 轮，且没有正在回退/探索的需求时停止
             if not self.training and halt_logit.item() > 0 and round_idx > 0:
-                log_msg(
-                    "INFO",
-                    "ACT halt 触发，提前停止检索",
-                    round_idx=round_idx,
-                    halt_logit=round(halt_logit.item(), 4),
-                )
+                log_msg("INFO", "ACT halt 触发", round_idx=round_idx)
                 break
 
+        # 去重并限额（按 score 排序）
+        all_paths = sorted(all_paths, key=lambda x: x.score, reverse=True)[:self.config.max_paths]
+        # Frame hits 按时间戳去重，保留最高分
+        unique_hits: Dict[float, FrameHit] = {}
+        for hit in all_frame_hits:
+            if hit.timestamp not in unique_hits or hit.score > unique_hits[hit.timestamp].score:
+                unique_hits[hit.timestamp] = hit
+        all_frame_hits = sorted(unique_hits.values(), key=lambda x: x.score, reverse=True)[:20]
+
         result: Dict[str, Any] = {
-            "paths": paths,
-            "num_rounds": len(paths),
+            "paths": all_paths,
+            "frame_hits": all_frame_hits,
+            "num_rounds": round_idx + 1,
             "z_final": z,
         }
         if return_internals:
@@ -446,84 +456,85 @@ class RecursiveRetriever(nn.Module):
 
         return result
 
-    def _traverse_one_path(
-        self,
-        q: Tensor,
-        z: Tensor,
-        tree: TreeIndex,
-    ) -> Tuple[Tuple[int, int, int], Tensor, List[Tensor]]:
-        """单次 L1 → L2 → L3 三阶段树遍历。
-
-        参数:
-            q: 查询嵌入，形状 [B, D]（冻结，轮间不变）。
-            z: 当前潜在状态，形状 [B, D]（轮间累积）。
-            tree: TreeIndex。
-
-        返回:
-            path:       (k1, k2, k3) 整数三元组，路径索引。
-            z_new:      更新后的潜在状态，形状 [B, D]。
-            step_attns: 三步的 attn_weights 列表，各 [B, N]。
-
-        实现细节:
-            - M_L1/M_L2/M_L3 从 TreeIndex 提取后转为与 q 同设备的 Tensor
-            - 每层调用 _select_and_reason，更新 z 并记录 attn_weights
-        """
+    def _traverse_multi_path(
+        self, q: Tensor, z: Tensor, tree: TreeIndex
+    ) -> Tuple[List[RetrievalPath], List[FrameHit], Tensor, List[Tensor]]:
+        """执行带 Top-k 和回退机制的单轮多路径遍历。"""
         step_attns: List[Tensor] = []
+        paths: List[RetrievalPath] = []
+        frame_hits: List[FrameHit] = []
 
-        # Phase 1: L1 粗粒度路由
-        M_L1 = torch.tensor(
-            tree.l1_embeddings(), dtype=torch.float32, device=q.device
-        )  # [N1, D]
-        k1, z, attn_w1 = self._select_and_reason(q, z, M_L1.unsqueeze(0))
+        # 1. L1 层级
+        M_L1 = torch.tensor(tree.l1_embeddings(), dtype=torch.float32, device=q.device).unsqueeze(0)
+        selected_info_l1, attn_w1, topk_idx_l1, topk_scores_l1 = self.selector(q + z, M_L1, k=self.config.k_l1)
         step_attns.append(attn_w1)
 
-        # Phase 2: L2 细粒度聚焦（k1 的子节点）
-        M_L2 = torch.tensor(
-            tree.l2_embeddings_of(k1), dtype=torch.float32, device=q.device
-        )  # [N2, D]
-        k2, z, attn_w2 = self._select_and_reason(q, z, M_L2.unsqueeze(0))
-        step_attns.append(attn_w2)
+        # 2. 遍历 L1 候选
+        z_updated_list = []
+        for i in range(topk_idx_l1.shape[1]):
+            k1 = topk_idx_l1[0, i].item()
+            s1 = topk_scores_l1[0, i].item()
+            
+            z_path_l1 = z + selected_info_l1
+            for _ in range(self.L_cycles):
+                z_path_l1 = self.L_level(z_path_l1, selected_info_l1 + q)
 
-        # Phase 3: L3 精确定位（k2 的子节点）
-        M_L3 = torch.tensor(
-            tree.l3_embeddings_of(k1, k2), dtype=torch.float32, device=q.device
-        )  # [N3, D]
-        k3, z, attn_w3 = self._select_and_reason(q, z, M_L3.unsqueeze(0))
-        step_attns.append(attn_w3)
+            # L2 层级
+            M_L2 = torch.tensor(tree.l2_embeddings_of(k1), dtype=torch.float32, device=q.device).unsqueeze(0)
+            selected_info_l2, attn_w2, topk_idx_l2, topk_scores_l2 = self.selector(q + z_path_l1, M_L2, k=self.config.k_l2)
+            step_attns.append(attn_w2)
 
-        return (k1, k2, k3), z, step_attns
+            # 3. 遍历 L2 候选
+            for j in range(topk_idx_l2.shape[1]):
+                k2 = topk_idx_l2[0, j].item()
+                s2 = topk_scores_l2[0, j].item()
+                
+                z_path_l2 = z_path_l1 + selected_info_l2
+                for _ in range(self.L_cycles):
+                    z_path_l2 = self.L_level(z_path_l2, selected_info_l2 + q)
 
-    def _select_and_reason(
-        self,
-        q: Tensor,
-        z: Tensor,
-        M: Tensor,
-    ) -> Tuple[int, Tensor, Tensor]:
-        """单层 Cross-Attention 选择 + L_cycles 内循环推理。
+                # L3 层级
+                M_L3 = torch.tensor(tree.l3_embeddings_of(k1, k2), dtype=torch.float32, device=q.device).unsqueeze(0)
+                selected_info_l3, attn_w3, topk_idx_l3, topk_scores_l3 = self.selector(q + z_path_l2, M_L3, k=self.config.k_l3)
+                step_attns.append(attn_w3)
 
-        参数:
-            q: 查询嵌入，形状 [B, D]（不变）。
-            z: 当前潜在状态，形状 [B, D]。
-            M: 该层候选节点嵌入，形状 [B, N, D]。
+                # 4. 回退/探索逻辑：如果 L3 最高分太低，尝试在当前 L2 下扩大搜索范围 (k_l3 * 2)
+                if topk_scores_l3[0, 0] < self.low_conf_threshold:
+                    log_msg("INFO", "L3 置信度低，尝试扩大该节点下的搜索范围", k2=k2, score=topk_scores_l3[0, 0].item())
+                    _, _, topk_idx_l3, topk_scores_l3 = self.selector(q + z_path_l2, M_L3, k=self.config.k_l3 * 2)
 
-        返回:
-            k_star:      int，选中节点索引（argmax，非可微）。
-            z_new:       更新后的潜在状态，形状 [B, D]。
-            attn_weights: 归一化注意力权重，形状 [B, N]（用于 NavigationLoss）。
+                for l in range(topk_idx_l3.shape[1]):
+                    k3 = topk_idx_l3[0, l].item()
+                    s3 = topk_scores_l3[0, l].item()
+                    
+                    total_score = s1 * s2 * s3
+                    node = tree.get_node(k1, k2, k3)
+                    
+                    path = RetrievalPath(
+                        k1=k1, k2=k2, k3=k3, score=total_score,
+                        l1_summary=tree.roots[k1].summary,
+                        l2_description=tree.roots[k1].children[k2].description,
+                        l3_description=node.description,
+                        raw_content=getattr(node, "raw_content", None),
+                        frame_path=getattr(node, "frame_path", None),
+                        timestamp=getattr(node, "timestamp", None)
+                    )
+                    paths.append(path)
+                    
+                    if path.frame_path:
+                        frame_hits.append(FrameHit(
+                            timestamp=path.timestamp, score=total_score,
+                            frame_path=path.frame_path,
+                            l3_id=node.id, l2_id=tree.roots[k1].children[k2].id,
+                            l1_id=tree.roots[k1].id
+                        ))
+                
+                z_updated_list.append(z_path_l2 + selected_info_l3)
 
-        实现细节:
-            state = q + z（融合查询与当前状态作为 Q 输入）
-            z 先通过 CA 软更新，再经 L_cycles 次 MLP 推理
-        """
-        state = q + z  # [B, D]
-        selected_info, attn_weights, selected_idx = self.selector(state, M)
+        # 更新全局 z
+        if z_updated_list:
+            z = torch.stack(z_updated_list).mean(dim=0)
+            for _ in range(self.L_cycles):
+                z = self.L_level(z, q)
 
-        # 软更新 z（可微）
-        z = z + selected_info
-
-        # L_cycles 次 MLP 推理（注入 selected_info + q）
-        for _ in range(self.L_cycles):
-            z = self.L_level(z, selected_info + q)
-
-        k_star: int = selected_idx.item()
-        return k_star, z, attn_weights
+        return paths, frame_hits, z, step_attns

@@ -2,10 +2,10 @@ tree:
   max_paragraphs_per_l2: 5
   l1_segment_duration: 600.0           # L1: 每段 10 分钟（长视频适配）
   l2_clip_duration: 60.0               # L2: 每 clip 60 秒
-  l3_fps: 1.0                          # L3: 1 帧/秒
-  l2_representative_frames: 10         # L2 VLM 描述用的代表帧数
+  l3_fps: 0.5                          # L3: 0.5 帧/秒（每 2 秒一帧）
+  l2_representative_frames: 6          # L2 VLM 描述用的代表帧数（从10降到6以提速）
   cache_dir: "data/videomme/trees"     # 树索引缓存目录（相对项目根目录）
-  concurrency: 16                      # 视频内 L2/L3 任务并发数
+  concurrency: 16                      # asyncio Semaphore 上限：每视频最多 16 路同时在途 VLM 请求
 
 embed:
   backend: "local"                     # CPU 本地运行，无需远程嵌入服务
@@ -27,7 +27,7 @@ vlm:
   backend: "openai"                    # GPUStack 兼容 OpenAI API
   model: "qwen3-vl-30b-a3b-instruct"
   api_url: "http://100.83.164.94:11062/v1"
-  max_tokens: 256
+  max_tokens: 512                      # 5帧描述 ~300 tokens，256 会截断 JSON 触发 fallback
   temperature: 0.1
   # api_key: 从 .env 加载
 
@@ -39,6 +39,10 @@ retriever:
   max_rounds: 5
   ffn_expansion: 2.0
   checkpoint: null
+  k_l1: 1
+  k_l2: 1
+  k_l3: 1
+  max_paths: 5
 
 train:
   lr: 1.0e-4
@@ -53,4 +57,4 @@ train:
   eval_interval: 5
   save_dir: "data/videomme/checkpoints"
   dataset: "videomme"
-  dataset_path: "data/videomme/metadata"
+  dataset_path: "data/videomme/splits/train.jsonl"

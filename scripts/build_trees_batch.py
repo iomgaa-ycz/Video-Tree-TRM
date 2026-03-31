@@ -1,23 +1,30 @@
 """
-批量视频建树脚本（视频间并行 + 视频内异步 L2/L3 并发）
+批量视频建树脚本（视频间并行 + 视频内 asyncio 真并发）
 ==========================================================
 扫描指定目录下所有 MP4，跳过已有 JSON 树的视频，
-使用 ThreadPoolExecutor 进行视频间并行（--jobs），
-每个视频内部使用 config.tree.concurrency 并发（默认 16）。
+使用 ThreadPoolExecutor 进行视频间并行（--jobs，默认 1），
+每个视频内部使用 asyncio + Semaphore(concurrency=16) 真并发 VLM 调用。
+
+并发架构::
+
+    外层: ThreadPoolExecutor(max_workers=jobs=1)  — 视频间并行（默认 1 路）
+    内层: asyncio.run(_build_async())              — 每视频独立事件循环
+          asyncio.Semaphore(concurrency=16)        — 限制同时在途 VLM 请求数
+    总最大 VLM 并发: jobs × concurrency = 1 × 16 = 16
 
 用法::
 
-    # 串行（安全，适合 API 配额紧张时）
+    # 默认 1 路 16 并发
     conda run -n Video-Tree-TRM python scripts/build_trees_batch.py
 
-    # 2 路视频并行（共 32 路 VLM 并发）
+    # 指定路数
     conda run -n Video-Tree-TRM python scripts/build_trees_batch.py --jobs 2
 
     # 指定目录和配置
     conda run -n Video-Tree-TRM python scripts/build_trees_batch.py \\
         --video-dir data/videomme/videos \\
         --config config/videomme.yaml \\
-        --jobs 2
+        --jobs 3
 """
 
 from __future__ import annotations
@@ -58,6 +65,11 @@ def _build_one(
     """
     stem = video_path.stem
     try:
+        progress_dir = Path(cfg.tree.cache_dir) / "progress"
+        progress_path = progress_dir / f"{stem}.json"
+        if progress_path.is_file():
+            log_msg("INFO", "检测到中间进度，启用断点续跑", stem=stem, progress_path=str(progress_path))
+
         # 每线程独立 LLMClient（httpx.Client 线程安全，但独立更稳健）
         vlm = LLMClient(cfg.vlm)
         builder = VideoTreeBuilder(vlm, cfg.tree)
@@ -98,7 +110,7 @@ def main() -> None:
         "--jobs",
         type=int,
         default=1,
-        help="视频间并行数（默认: 1，每路视频内部已有 concurrency 路并发）",
+        help="视频间并行数（默认: 1，每路视频内 asyncio Semaphore(concurrency) 并发 VLM）",
     )
     args = parser.parse_args()
 
@@ -119,10 +131,18 @@ def main() -> None:
     all_videos: List[Path] = sorted(video_dir.glob("*.mp4"))
 
     cache_dir = Path(cfg.tree.cache_dir)
-    pending: List[Path] = [
-        v for v in all_videos
-        if not (cache_dir / f"{v.stem}_video.json").exists()
-    ]
+    progress_dir = cache_dir / "progress"
+    with_progress: List[Path] = []
+    without_progress: List[Path] = []
+    for v in all_videos:
+        if (cache_dir / f"{v.stem}_video.json").exists():
+            continue
+        progress_path = progress_dir / f"{v.stem}.json"
+        if progress_path.is_file():
+            with_progress.append(v)
+        else:
+            without_progress.append(v)
+    pending: List[Path] = with_progress + without_progress
     skipped = len(all_videos) - len(pending)
 
     print(f"\n===== 批量建树 =====")
